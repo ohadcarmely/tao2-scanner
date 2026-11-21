@@ -4,39 +4,23 @@ const { default: YahooFinance } = require('yahoo-finance2');
 
 const yahooFinance = new YahooFinance();
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
 
-// רשימת ברירת מחדל של סימולים באנגלית (ניתן לשלוח רשימה מותאמת אישית ב-GET או POST)
+// 50 המניות הגדולות בנאסד"ק (ברירת מחדל)
 const DEFAULT_SYMBOLS = [
-  'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'TSLA',
-  'AMD', 'AVGO', 'PLTR', 'COIN', 'NFLX', 'CRM', 'UBER'
+  'AAPL', 'NVDA', 'MSFT', 'AMZN', 'META', 'AVGO', 'GOOGL', 'TSLA', 'COST', 'NFLX',
+  'TMUS', 'ASML', 'CSCO', 'PLTR', 'AMD', 'PEP', 'LIN', 'AZN', 'ADBE', 'QCOM',
+  'TXN', 'INTU', 'ISRG', 'AMGN', 'BKNG', 'HON', 'CMCSA', 'AMAT', 'PDD', 'ARM',
+  'PANW', 'VRTX', 'ADP', 'GILD', 'MU', 'SBUX', 'MELI', 'ADI', 'LRCX', 'KLAC',
+  'INTC', 'MDLZ', 'CTAS', 'CRWD', 'SNPS', 'CDNS', 'REGN', 'PYPL', 'MAR', 'ORLY'
 ];
 
-function calculateSMA(values, period) {
-  if (values.length < period) return null;
-  const slice = values.slice(-period);
-  return slice.reduce((sum, v) => sum + v, 0) / period;
-}
-
-function calculateATR14(candles) {
-  if (candles.length < 15) return null;
-  const trs = [];
-  for (let i = 1; i < candles.length; i++) {
-    const cur = candles[i];
-    const prev = candles[i - 1];
-    const tr = Math.max(
-      cur.high - cur.low,
-      Math.abs(cur.high - prev.close),
-      Math.abs(cur.low - prev.close)
-    );
-    trs.push(tr);
-  }
-  const recent14 = trs.slice(-14);
-  return recent14.reduce((sum, v) => sum + v, 0) / 14;
-}
+// זיכרון מטמון קצר (5 דקות) למניעת שליפות כפולות וחסימות מ-Yahoo Finance
+const CACHE_TTL_MS = 5 * 60 * 1000;
+const symbolCache = new Map();
 
 function cleanEnglishText(text, fallback) {
   const cleaned = String(text || '')
@@ -46,85 +30,225 @@ function cleanEnglishText(text, fallback) {
   return cleaned || fallback;
 }
 
-async function analyzeSymbol(symbol) {
+function formatDateYMD(dateObj) {
+  const d = new Date(dateObj);
+  const year = d.getUTCFullYear();
+  const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function calcCalendarDaysAgo(dateObj) {
+  const now = new Date();
+  const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const d = new Date(dateObj);
+  const candleUTC = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+  return Math.max(0, Math.round((todayUTC - candleUTC) / (1000 * 60 * 60 * 24)));
+}
+
+// חישוב סדרת SMA 200 ו-ATR 14 (RMA - Wilder's Smoothing כמו ב-TradingView)
+function computeIndicatorsSeries(quotes, smaPeriod = 200, atrPeriod = 14) {
+  const n = quotes.length;
+  const sma = new Array(n).fill(null);
+  const atr = new Array(n).fill(null);
+  const tr = new Array(n).fill(0);
+
+  let closeSum = 0;
+
+  for (let i = 0; i < n; i++) {
+    closeSum += quotes[i].close;
+    if (i >= smaPeriod) {
+      closeSum -= quotes[i - smaPeriod].close;
+    }
+    if (i >= smaPeriod - 1) {
+      sma[i] = closeSum / smaPeriod;
+    }
+
+    if (i === 0) {
+      tr[i] = quotes[i].high - quotes[i].low;
+    } else {
+      const cur = quotes[i];
+      const prevClose = quotes[i - 1].close;
+      tr[i] = Math.max(
+        cur.high - cur.low,
+        Math.abs(cur.high - prevClose),
+        Math.abs(cur.low - prevClose)
+      );
+    }
+
+    if (i === atrPeriod) {
+      let trSum = 0;
+      for (let k = 1; k <= atrPeriod; k++) trSum += tr[k];
+      atr[i] = trSum / atrPeriod;
+    } else if (i > atrPeriod) {
+      atr[i] = (atr[i - 1] * (atrPeriod - 1) + tr[i]) / atrPeriod;
+    }
+  }
+
+  return quotes.map((q, i) => {
+    const hasBoth = sma[i] !== null && atr[i] !== null;
+    return {
+      date: q.date,
+      close: q.close,
+      low: q.low,
+      sma200: sma[i],
+      atr14: atr[i],
+      upperBuffer: hasBoth ? sma[i] + 2 * atr[i] : null,
+      rawLowerBuffer: hasBoth ? sma[i] - 2 * atr[i] : null
+    };
+  });
+}
+
+async function analyzeSymbol(symbol, { includeAllStatuses = false } = {}) {
   const cleanSymbol = cleanEnglishText(symbol, '').toUpperCase();
   if (!cleanSymbol) return null;
 
-  const endDate = new Date();
-  const startDate = new Date();
-  startDate.setDate(endDate.getDate() - 420);
+  // בדיקת Cache
+  const cached = symbolCache.get(cleanSymbol);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    const data = cached.data;
+    if (!data) return null;
+    if (!includeAllStatuses && data.status !== 'פריצה' && data.status !== 'קרובה לפריצה') {
+      return null;
+    }
+    return data;
+  }
 
-  const chart = await yahooFinance.chart(cleanSymbol, {
-    period1: startDate.toISOString().split('T')[0],
-    interval: '1d'
-  });
+  try {
+    const endDate = new Date();
+    const startDate = new Date();
+    startDate.setDate(endDate.getDate() - 420);
 
-  const quotes = (chart?.quotes || []).filter(
-    q =>
-      q &&
-      typeof q.close === 'number' &&
-      typeof q.high === 'number' &&
-      typeof q.low === 'number'
-  );
+    const chart = await yahooFinance.chart(cleanSymbol, {
+      period1: startDate.toISOString().split('T')[0],
+      interval: '1d'
+    });
 
-  if (quotes.length < 205) return null;
+    const quotes = (chart?.quotes || []).filter(
+      q =>
+        q &&
+        q.date &&
+        typeof q.close === 'number' &&
+        typeof q.high === 'number' &&
+        typeof q.low === 'number'
+    );
 
-  let breakoutDaysAgo = null;
-  let latestBreakoutLevel = null;
-  let latestClose = quotes[quotes.length - 1].close;
-
-  // בדיקת 1-3 הימים האחרונים לפריצה מעל קו TAO 2 (SMA 200 + 2 * ATR 14)
-  for (let offset = 0; offset < 3; offset++) {
-    const idx = quotes.length - 1 - offset;
-    const historyUpToIdx = quotes.slice(0, idx + 1);
-    const closes = historyUpToIdx.map(c => c.close);
-
-    const sma200 = calculateSMA(closes, 200);
-    const atr14 = calculateATR14(historyUpToIdx);
-
-    if (sma200 === null || atr14 === null) continue;
-
-    const breakoutLevel = sma200 + 2 * atr14;
-    const closeAtDay = historyUpToIdx[historyUpToIdx.length - 1].close;
-
-    if (offset === 0) {
-      latestBreakoutLevel = breakoutLevel;
-      latestClose = closeAtDay;
+    if (quotes.length < 205) {
+      symbolCache.set(cleanSymbol, { timestamp: Date.now(), data: null });
+      return null;
     }
 
-    if (closeAtDay > breakoutLevel && breakoutDaysAgo === null) {
-      breakoutDaysAgo = offset + 1;
-      if (offset > 0) {
-        latestBreakoutLevel = breakoutLevel;
+    const series = computeIndicatorsSeries(quotes, 200, 14);
+    const lastIdx = series.length - 1;
+    const latest = series[lastIdx];
+
+    if (!latest || latest.upperBuffer === null || latest.upperBuffer <= 0) {
+      symbolCache.set(cleanSymbol, { timestamp: Date.now(), data: null });
+      return null;
+    }
+
+    // סימולציית עסקאות TAO 2 על ההיסטוריה (תואם ל-strategy.position_size == 0 ב-TradingView)
+    let inPosition = false;
+    let entryIdx = null;
+    let trailStop = null;
+
+    for (let i = 1; i <= lastIdx; i++) {
+      const curr = series[i];
+      const prev = series[i - 1];
+      if (curr.upperBuffer === null || prev.upperBuffer === null) continue;
+
+      if (inPosition) {
+        // יציאה בסטופ אם הנמוך היומי נגע ב-trailStop
+        if (curr.low <= trailStop) {
+          inPosition = false;
+          entryIdx = null;
+          trailStop = null;
+        } else {
+          // הסטופ עולה בלבד ואינו יורד אחורה
+          trailStop = Math.max(trailStop, curr.rawLowerBuffer);
+        }
+      }
+
+      // כניסה חדשה רק כשאין עסקה פתוחה ויש חצייה אמיתית (crossover)
+      if (!inPosition && curr.close > curr.upperBuffer && prev.close <= prev.upperBuffer) {
+        inPosition = true;
+        entryIdx = i;
+        trailStop = curr.rawLowerBuffer;
       }
     }
+
+    const diffPercent = ((latest.close - latest.upperBuffer) / latest.upperBuffer) * 100;
+
+    let breakoutDate = null;
+    let breakoutDaysAgo = null;
+    let breakoutTradingDaysAgo = null;
+    const activeStop = inPosition && trailStop !== null ? trailStop : latest.rawLowerBuffer;
+
+    if (inPosition && entryIdx !== null) {
+      breakoutDate = formatDateYMD(series[entryIdx].date);
+      breakoutDaysAgo = calcCalendarDaysAgo(series[entryIdx].date);
+      breakoutTradingDaysAgo = lastIdx - entryIdx;
+    }
+
+    // סיווג סטטוס: פריצה נקייה = 0 עד 3 ימי מסחר וגם מרחק של עד 4% מעל הרמה
+    let status = 'ניטרלי';
+    if (
+      inPosition &&
+      breakoutTradingDaysAgo !== null &&
+      breakoutTradingDaysAgo <= 3 &&
+      diffPercent >= 0 &&
+      diffPercent <= 4
+    ) {
+      status = 'פריצה';
+    } else if (!inPosition && latest.close <= latest.upperBuffer && diffPercent >= -4 && diffPercent < 0) {
+      status = 'קרובה לפריצה';
+    } else if (inPosition) {
+      status = 'בעסקה פעילה (מעל הטווח)';
+    }
+
+    const riskPercent =
+      latest.close > 0 ? ((latest.close - activeStop) / latest.close) * 100 : 0;
+
+    const rawName = chart?.meta?.shortName || chart?.meta?.longName || cleanSymbol;
+    const englishName = cleanEnglishText(rawName, cleanSymbol);
+
+    const result = {
+      symbol: cleanSymbol,
+      name: englishName,
+      price: Number(latest.close.toFixed(2)),
+      breakoutLevel: Number(latest.upperBuffer.toFixed(2)),
+      diffPercent: Number(diffPercent.toFixed(2)),
+      stopLoss: Number(activeStop.toFixed(2)),
+      riskPercent: Number(riskPercent.toFixed(1)),
+      breakoutDate: status === 'פריצה' || includeAllStatuses ? breakoutDate : null,
+      breakoutDaysAgo: status === 'פריצה' || includeAllStatuses ? breakoutDaysAgo : null,
+      breakoutTradingDaysAgo: status === 'פריצה' || includeAllStatuses ? breakoutTradingDaysAgo : null,
+      isFreshToday: status === 'פריצה' && breakoutTradingDaysAgo === 0,
+      status
+    };
+
+    symbolCache.set(cleanSymbol, { timestamp: Date.now(), data: result });
+
+    if (!includeAllStatuses && status !== 'פריצה' && status !== 'קרובה לפריצה') {
+      return null;
+    }
+
+    return result;
+  } catch (err) {
+    console.error(`Failed to analyze ${cleanSymbol}:`, err.message);
+    return null;
   }
+}
 
-  if (latestBreakoutLevel === null || latestBreakoutLevel <= 0) return null;
-
-  const diffPercent = ((latestClose - latestBreakoutLevel) / latestBreakoutLevel) * 100;
-
-  let status = null;
-  if (breakoutDaysAgo !== null && diffPercent >= 0 && diffPercent <= 4) {
-    status = 'פריצה';
-  } else if (latestClose <= latestBreakoutLevel && diffPercent >= -4 && diffPercent < 0) {
-    status = 'קרובה לפריצה';
+// סריקה בקבוצות (Batches) למניעת Rate Limit מ-Yahoo Finance
+async function analyzeInBatches(symbols, batchSize = 5) {
+  const results = [];
+  for (let i = 0; i < symbols.length; i += batchSize) {
+    const batch = symbols.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(s => analyzeSymbol(s)));
+    results.push(...batchResults);
   }
-
-  if (!status) return null;
-
-  const rawName = chart?.meta?.shortName || chart?.meta?.longName || cleanSymbol;
-  const englishName = cleanEnglishText(rawName, cleanSymbol);
-
-  return {
-    symbol: cleanSymbol,
-    name: englishName,
-    price: Number(latestClose.toFixed(2)),
-    breakoutLevel: Number(latestBreakoutLevel.toFixed(2)),
-    diffPercent: Number(diffPercent.toFixed(2)),
-    breakoutDaysAgo,
-    status
-  };
+  return results.filter(Boolean);
 }
 
 async function handleScan(symbolsInput, res) {
@@ -142,15 +266,23 @@ async function handleScan(symbolsInput, res) {
       )
     ];
 
-    const results = await Promise.all(uniqueSymbols.map(analyzeSymbol));
-    const filtered = results.filter(Boolean);
+    const filtered = await analyzeInBatches(uniqueSymbols, 5);
+
+    const breakout = filtered
+      .filter(item => item.status === 'פריצה')
+      .sort((a, b) => (a.breakoutTradingDaysAgo ?? 99) - (b.breakoutTradingDaysAgo ?? 99));
+
+    const nearBreakout = filtered
+      .filter(item => item.status === 'קרובה לפריצה')
+      .sort((a, b) => b.diffPercent - a.diffPercent);
 
     res.json({
       appName: 'אוהד מניות',
       strategy: 'TAO 2',
       updatedAt: new Date().toISOString(),
-      breakout: filtered.filter(item => item.status === 'פריצה'),
-      nearBreakout: filtered.filter(item => item.status === 'קרובה לפריצה')
+      scannedCount: uniqueSymbols.length,
+      breakout,
+      nearBreakout
     });
   } catch (err) {
     res.status(500).json({
@@ -160,6 +292,12 @@ async function handleScan(symbolsInput, res) {
   }
 }
 
+// נתיב בדיקת תקינות (שימושי גם ל-UptimeRobot כדי שהשרת לא יירדם)
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'TAO 2 Scanner', defaultSymbolsCount: DEFAULT_SYMBOLS.length });
+});
+
+// סריקה מלאה (GET)
 app.get('/api/scan', async (req, res) => {
   const fromQuery = req.query.symbols
     ? String(req.query.symbols).split(',').map(s => s.trim()).filter(Boolean)
@@ -167,10 +305,24 @@ app.get('/api/scan', async (req, res) => {
   await handleScan(fromQuery, res);
 });
 
+// סריקה מלאה (POST)
 app.post('/api/scan', async (req, res) => {
   await handleScan(req.body?.symbols, res);
 });
 
+// בדיקה מהירה למניה בודדת (למשל: /api/check?symbol=QUBT)
+app.get('/api/check', async (req, res) => {
+  const symbol = req.query.symbol;
+  if (!symbol) {
+    return res.status(400).json({ error: 'נא לספק סימול מניה (symbol)' });
+  }
+  const result = await analyzeSymbol(symbol, { includeAllStatuses: true });
+  if (!result) {
+    return res.status(404).json({ error: `לא נמצאו מספיק נתונים עבור ${symbol}` });
+  }
+  res.json(result);
+});
+
 app.listen(PORT, () => {
-  console.log(`Ohad Stocks (TAO 2) server running on http://localhost:${PORT}`);
+  console.log(`Ohad Stocks (TAO 2) server running on port ${PORT}`);
 });
