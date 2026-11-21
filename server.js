@@ -158,18 +158,15 @@ async function analyzeSymbol(symbol, { includeAllStatuses = false } = {}) {
       if (curr.upperBuffer === null || prev.upperBuffer === null) continue;
 
       if (inPosition) {
-        // יציאה בסטופ אם הנמוך היומי נגע ב-trailStop
         if (curr.low <= trailStop) {
           inPosition = false;
           entryIdx = null;
           trailStop = null;
         } else {
-          // הסטופ עולה בלבד ואינו יורד אחורה
           trailStop = Math.max(trailStop, curr.rawLowerBuffer);
         }
       }
 
-      // כניסה חדשה רק כשאין עסקה פתוחה ויש חצייה אמיתית (crossover)
       if (!inPosition && curr.close > curr.upperBuffer && prev.close <= prev.upperBuffer) {
         inPosition = true;
         entryIdx = i;
@@ -321,6 +318,25 @@ app.get('/api/check', async (req, res) => {
     return res.status(404).json({ error: `לא נמצאו מספיק נתונים עבור ${symbol}` });
   }
   res.json(result);
+});
+
+// חיפוש והשלמה אוטומטית למניות אמיתיות (למשל: /api/search?q=palantir)
+app.get('/api/search', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (q.length < 1) return res.json([]);
+  try {
+    const searchRes = await yahooFinance.search(q, { quotesCount: 6, newsCount: 0 });
+    const items = (searchRes?.quotes || [])
+      .filter(item => item.symbol && (item.quoteType === 'EQUITY' || item.quoteType === 'ETF'))
+      .map(item => ({
+        symbol: item.symbol,
+        name: cleanEnglishText(item.shortname || item.longname || item.symbol, item.symbol),
+        exchange: item.exchDisp || ''
+      }));
+    res.json(items);
+  } catch (err) {
+    res.json([]);
+  }
 });
 
 app.listen(PORT, () => {
