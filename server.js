@@ -1,10 +1,19 @@
 const express = require('express');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
+
+// אישור CORS לחיבור מ-Google AI Studio ומדפדפנים חיצוניים
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 app.use(express.static(__dirname));
 
 // רשימת המניות לסריקה
@@ -165,7 +174,7 @@ app.get('/', (req, res) => {
   res.send('TAO2 Scanner is running');
 });
 
-// נתיב סריקה (JSON)
+// נתיב סריקה (GET)
 app.get('/api/scan', async (req, res) => {
   try {
     const breakouts = await runScan();
@@ -175,10 +184,22 @@ app.get('/api/scan', async (req, res) => {
   }
 });
 
+// נתיב סריקה (POST - לרשימות מניות מותאמות מהאפליקציה)
+app.post('/api/scan', async (req, res) => {
+  try {
+    const symbols = Array.isArray(req.body?.symbols) && req.body.symbols.length > 0
+      ? req.body.symbols
+      : SYMBOLS;
+    const breakouts = await runScan(symbols);
+    res.json({ ok: true, count: breakouts.length, breakouts });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // נתיב התראות לטלגרם
 app.get('/api/alert', async (req, res) => {
   try {
-    // בדיקה ידנית מהירה
     if (req.query.test === 'true') {
       await sendTelegramMessage('<b>TAO 2</b>\nהודעת בדיקה — הבוט מחובר ועובד!');
       return res.json({ ok: true, message: 'Test alert sent!' });
