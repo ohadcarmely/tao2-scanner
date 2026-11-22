@@ -197,6 +197,60 @@ app.post('/api/scan', async (req, res) => {
   }
 });
 
+// בדיקת מניה בודדת
+async function handleSingleStock(req, res) {
+  try {
+    const rawSymbol = req.params.symbol || req.query.symbol || req.body?.symbol || '';
+    const symbol = String(rawSymbol).trim().toUpperCase();
+    if (!symbol) {
+      return res.status(400).json({ ok: false, error: 'Missing symbol' });
+    }
+
+    const stock = await fetchStockData(symbol);
+    if (!stock) {
+      return res.status(404).json({ ok: false, error: 'Symbol not found' });
+    }
+
+    const { name, candles } = stock;
+    const closes = candles.map(c => c.close);
+    const last = candles[candles.length - 1];
+    const prev = candles[candles.length - 2];
+
+    const sma200 = calculateSMA(closes, 200);
+    const atr14 = calculateATR(candles, 14);
+    const lookback = candles.slice(candles.length - 21, candles.length - 1);
+    const breakoutLevel = Math.max(...lookback.map(c => c.high));
+
+    const isBreakout = Boolean(sma200 && atr14 && last.close > sma200 && last.close > breakoutLevel);
+    const isFresh = prev.close <= breakoutLevel;
+    const stopLoss = sma200 && atr14 ? Math.max(0.01, sma200 - 2 * atr14) : null;
+    const riskPercent = stopLoss != null
+      ? Number((((last.close - stopLoss) / last.close) * 100).toFixed(1))
+      : null;
+
+    res.json({
+      ok: true,
+      symbol,
+      name,
+      price: last.close,
+      breakoutLevel,
+      sma200,
+      atr14,
+      stopLoss,
+      riskPercent,
+      isBreakout,
+      isFresh
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+}
+
+app.get('/api/check/:symbol', handleSingleStock);
+app.get('/api/stock/:symbol', handleSingleStock);
+app.get('/api/check', handleSingleStock);
+app.get('/api/stock', handleSingleStock);
+
 // נתיב התראות לטלגרם
 app.get('/api/alert', async (req, res) => {
   try {
