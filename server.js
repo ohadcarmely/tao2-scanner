@@ -1,7 +1,10 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const CUSTOM_SYMBOLS_FILE = path.join(__dirname, 'custom-symbols.json');
 
 app.use(express.json());
 
@@ -16,14 +19,48 @@ app.use((req, res, next) => {
 
 app.use(express.static(__dirname));
 
-// רשימת המניות לסריקה
-const SYMBOLS = [
+// רשימת המניות הבסיסית לסריקה
+const DEFAULT_SYMBOLS = [
   'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'TSLA', 'AVGO', 'COST', 'NFLX',
   'AMD', 'QCOM', 'TXN', 'INTU', 'AMAT', 'MU', 'LRCX', 'KLAC', 'SNPS', 'CDNS',
   'ADBE', 'CRM', 'ORCL', 'PANW', 'CRWD', 'PLTR', 'SNOW', 'DDOG', 'NET', 'ZS',
   'ISRG', 'VRTX', 'REGN', 'GILD', 'AMGN', 'MRNA', 'PEP', 'SBUX', 'MDLZ', 'MNST',
   'BKNG', 'ABNB', 'UBER', 'DASH', 'PYPL', 'COIN', 'TTWO', 'EA', 'IONQ', 'QUBT'
 ];
+
+// טעינה ושמירה של מניות שנוספו ידנית
+function loadCustomSymbols() {
+  try {
+    if (!fs.existsSync(CUSTOM_SYMBOLS_FILE)) return [];
+    const raw = fs.readFileSync(CUSTOM_SYMBOLS_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.map(s => String(s).trim().toUpperCase()).filter(Boolean)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveCustomSymbols(list) {
+  try {
+    const unique = [...new Set(list.map(s => String(s).trim().toUpperCase()).filter(Boolean))];
+    fs.writeFileSync(CUSTOM_SYMBOLS_FILE, JSON.stringify(unique, null, 2), 'utf8');
+    return unique;
+  } catch (err) {
+    console.error('Failed saving custom symbols:', err.message);
+    return list;
+  }
+}
+
+function getAllSymbols(extraSymbols = []) {
+  const custom = loadCustomSymbols();
+  return [...new Set([
+    ...DEFAULT_SYMBOLS,
+    ...custom,
+    ...extraSymbols.map(s => String(s).trim().toUpperCase()).filter(Boolean)
+  ])];
+}
 
 // משיכת נתונים מ-Yahoo Finance
 async function fetchStockData(symbol) {
@@ -89,7 +126,7 @@ function calculateATR(candles, period = 14) {
   return recent.reduce((acc, v) => acc + v, 0) / period;
 }
 
-// ניתוח מניה מלא (כולל שדות עבור בדיקת מניה בודדת)
+// ניתוח מניה מלא
 function buildStockAnalysis(stock) {
   const { symbol, name, candles } = stock;
   const closes = candles.map(c => c.close);
@@ -111,14 +148,22 @@ function buildStockAnalysis(stock) {
   const isActiveBreakout = Boolean(last.close > sma200 && last.close > breakoutLevel);
   const isFresh = prev.close <= breakoutLevel;
 
+  const diffPercent = breakoutLevel > 0
+    ? Number((((last.close - breakoutLevel) / breakoutLevel) * 100).toFixed(2))
+    : 0;
+
+  // קרוב לפריצה: מעל SMA200 ובטווח של עד 3% מתחת לרמת הפריצה
+  const isNearBreakout = Boolean(
+    !isActiveBreakout &&
+    last.close > sma200 &&
+    diffPercent >= -3 &&
+    diffPercent < 0
+  );
+
   const rawStop = sma200 - 2 * atr14;
   const stopLoss = Number(Math.max(0.01, rawStop).toFixed(2));
   const riskPercent = last.close > 0
     ? Number((((last.close - stopLoss) / last.close) * 100).toFixed(1))
-    : 0;
-
-  const diffPercent = breakoutLevel > 0
-    ? Number((((last.close - breakoutLevel) / breakoutLevel) * 100).toFixed(2))
     : 0;
 
   let breakoutDate = null;
@@ -131,7 +176,9 @@ function buildStockAnalysis(stock) {
 
   const status = isActiveBreakout
     ? (isFresh ? 'פריצה טרייה מעל SMA200' : 'פריצה פעילה מעל SMA200')
-    : (last.close > sma200 ? 'מעל SMA200 · ממתין לפריצת שיא 20 ימים' : 'מתחת ל-SMA200');
+    : isNearBreakout
+      ? 'קרוב לפריצה · מעל SMA200'
+      : (last.close > sma200 ? 'מעל SMA200 · ממתין לפריצת שיא 20 ימים' : 'מתחת ל-SMA200');
 
   return {
     symbol,
@@ -145,6 +192,7 @@ function buildStockAnalysis(stock) {
     diffPercent,
     isBreakout: isActiveBreakout,
     isActiveBreakout,
+    isNearBreakout,
     isFresh,
     breakoutDate,
     breakoutDaysAgo,
@@ -152,27 +200,28 @@ function buildStockAnalysis(stock) {
   };
 }
 
-// ניתוח מניה לסריקה רגילה (מחזיר רק מניות בפריצה)
-function analyzeStock(stock) {
-  const analysis = buildStockAnalysis(stock);
-  if (!analysis.isActiveBreakout) return null;
-  return analysis;
-}
+// הרצת סריקה — מחזירה פריצות פעילות וגם מניות קרוב לפריצה (עד 3%)
+async function runScan(symbols = []) {
+  const targetList = getAllSymbols(symbols);
+  const breakouts = [];
+  const nearBreakouts = [];
 
-// הרצת סריקה על רשימת מניות
-async function runScan(symbols = SYMBOLS) {
-  const results = [];
-  for (const symbol of symbols) {
+  for (const symbol of targetList) {
     try {
       const stock = await fetchStockData(symbol);
       if (!stock) continue;
-      const analysis = analyzeStock(stock);
-      if (analysis) results.push(analysis);
+      const analysis = buildStockAnalysis(stock);
+      if (analysis.isActiveBreakout) {
+        breakouts.push(analysis);
+      } else if (analysis.isNearBreakout) {
+        nearBreakouts.push(analysis);
+      }
     } catch (err) {
       console.error(`Error scanning ${symbol}:`, err.message);
     }
   }
-  return results;
+
+  return { breakouts, nearBreakouts, scannedCount: targetList.length };
 }
 
 // שליחת הודעה לטלגרם
@@ -202,9 +251,41 @@ async function sendTelegramMessage(text) {
   }
 }
 
-// דף הבית / בדיקת זמינות
+// דף הבית
 app.get('/', (req, res) => {
   res.send('TAO2 Scanner is running');
+});
+
+// ניהול מניות ידניות (הוספה / צפייה / הסרה)
+app.get('/api/watchlist', (req, res) => {
+  res.json({
+    ok: true,
+    defaultSymbols: DEFAULT_SYMBOLS,
+    customSymbols: loadCustomSymbols(),
+    allSymbols: getAllSymbols()
+  });
+});
+
+app.post('/api/watchlist', (req, res) => {
+  const incoming = Array.isArray(req.body?.symbols)
+    ? req.body.symbols
+    : (req.body?.symbol ? [req.body.symbol] : []);
+
+  const normalized = incoming.map(s => String(s).trim().toUpperCase()).filter(Boolean);
+  if (normalized.length === 0) {
+    return res.status(400).json({ ok: false, error: 'Missing symbol' });
+  }
+
+  const current = loadCustomSymbols();
+  const updated = saveCustomSymbols([...current, ...normalized]);
+  res.json({ ok: true, customSymbols: updated, allSymbols: getAllSymbols() });
+});
+
+app.delete('/api/watchlist/:symbol', (req, res) => {
+  const target = String(req.params.symbol || '').trim().toUpperCase();
+  const current = loadCustomSymbols().filter(s => s !== target);
+  const updated = saveCustomSymbols(current);
+  res.json({ ok: true, customSymbols: updated, allSymbols: getAllSymbols() });
 });
 
 // חיפוש מניות להשלמה אוטומטית (/api/search?q=...)
@@ -240,21 +321,41 @@ app.get('/api/search', async (req, res) => {
 // נתיב סריקה (GET)
 app.get('/api/scan', async (req, res) => {
   try {
-    const breakouts = await runScan();
-    res.json({ ok: true, count: breakouts.length, breakouts });
+    const { breakouts, nearBreakouts, scannedCount } = await runScan();
+    res.json({
+      ok: true,
+      count: breakouts.length,
+      nearCount: nearBreakouts.length,
+      scannedCount,
+      breakouts,
+      nearBreakouts
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// נתיב סריקה (POST - לרשימות מניות מותאמות מהאפליקציה)
+// נתיב סריקה (POST - קולט כל מניה שהוספת ידנית באפליקציה וסורק אותה)
 app.post('/api/scan', async (req, res) => {
   try {
-    const symbols = Array.isArray(req.body?.symbols) && req.body.symbols.length > 0
-      ? req.body.symbols
-      : SYMBOLS;
-    const breakouts = await runScan(symbols);
-    res.json({ ok: true, count: breakouts.length, breakouts });
+    const manualSymbols = Array.isArray(req.body?.symbols)
+      ? req.body.symbols.map(s => String(s).trim().toUpperCase()).filter(Boolean)
+      : [];
+
+    // אם האפליקציה שולחת את הרשימה הידנית שלה, נשמור אותה גם כרשימה הידנית הפעילה
+    if (Array.isArray(req.body?.symbols)) {
+      saveCustomSymbols(manualSymbols);
+    }
+
+    const { breakouts, nearBreakouts, scannedCount } = await runScan(manualSymbols);
+    res.json({
+      ok: true,
+      count: breakouts.length,
+      nearCount: nearBreakouts.length,
+      scannedCount,
+      breakouts,
+      nearBreakouts
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -296,7 +397,8 @@ app.get('/api/alert', async (req, res) => {
     }
 
     const freshOnly = req.query.freshOnly === 'true';
-    let breakouts = await runScan();
+    const { breakouts: allBreakouts } = await runScan();
+    let breakouts = allBreakouts;
 
     if (freshOnly) {
       breakouts = breakouts.filter(b => b.isFresh);
