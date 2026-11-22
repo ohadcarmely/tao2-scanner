@@ -1,254 +1,139 @@
 const express = require('express');
-const cors = require('cors');
-const { default: YahooFinance } = require('yahoo-finance2');
+const path = require('path');
 
-const yahooFinance = new YahooFinance();
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 
-app.use(cors());
 app.use(express.json());
+app.use(express.static(__dirname));
 
-// 50 המניות הגדולות בנאסד"ק (ברירת מחדל)
-const DEFAULT_SYMBOLS = [
-  'AAPL', 'NVDA', 'MSFT', 'AMZN', 'META', 'AVGO', 'GOOGL', 'TSLA', 'COST', 'NFLX',
-  'TMUS', 'ASML', 'CSCO', 'PLTR', 'AMD', 'PEP', 'LIN', 'AZN', 'ADBE', 'QCOM',
-  'TXN', 'INTU', 'ISRG', 'AMGN', 'BKNG', 'HON', 'CMCSA', 'AMAT', 'PDD', 'ARM',
-  'PANW', 'VRTX', 'ADP', 'GILD', 'MU', 'SBUX', 'MELI', 'ADI', 'LRCX', 'KLAC',
-  'INTC', 'MDLZ', 'CTAS', 'CRWD', 'SNPS', 'CDNS', 'REGN', 'PYPL', 'MAR', 'ORLY'
+// רשימת המניות לסריקה
+const SYMBOLS = [
+  'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'TSLA', 'AVGO', 'COST', 'NFLX',
+  'AMD', 'QCOM', 'TXN', 'INTU', 'AMAT', 'MU', 'LRCX', 'KLAC', 'SNPS', 'CDNS',
+  'ADBE', 'CRM', 'ORCL', 'PANW', 'CRWD', 'PLTR', 'SNOW', 'DDOG', 'NET', 'ZS',
+  'ISRG', 'VRTX', 'REGN', 'GILD', 'AMGN', 'MRNA', 'PEP', 'SBUX', 'MDLZ', 'MNST',
+  'BKNG', 'ABNB', 'UBER', 'DASH', 'PYPL', 'COIN', 'TTWO', 'EA', 'IONQ', 'QUBT'
 ];
 
-// זיכרון מטמון קצר (5 דקות) למניעת שליפות כפולות וחסימות מ-Yahoo Finance
-const CACHE_TTL_MS = 5 * 60 * 1000;
-const symbolCache = new Map();
-
-function cleanEnglishText(text, fallback) {
-  const cleaned = String(text || '')
-    .replace(/[^\x20-\x7E]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return cleaned || fallback;
-}
-
-function formatDateYMD(dateObj) {
-  const d = new Date(dateObj);
-  const year = d.getUTCFullYear();
-  const month = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(d.getUTCDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
-}
-
-function calcCalendarDaysAgo(dateObj) {
-  const now = new Date();
-  const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-  const d = new Date(dateObj);
-  const candleUTC = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
-  return Math.max(0, Math.round((todayUTC - candleUTC) / (1000 * 60 * 60 * 24)));
-}
-
-// חישוב סדרת SMA 200 ו-ATR 14 (RMA - Wilder's Smoothing כמו ב-TradingView)
-function computeIndicatorsSeries(quotes, smaPeriod = 200, atrPeriod = 14) {
-  const n = quotes.length;
-  const sma = new Array(n).fill(null);
-  const atr = new Array(n).fill(null);
-  const tr = new Array(n).fill(0);
-
-  let closeSum = 0;
-
-  for (let i = 0; i < n; i++) {
-    closeSum += quotes[i].close;
-    if (i >= smaPeriod) {
-      closeSum -= quotes[i - smaPeriod].close;
-    }
-    if (i >= smaPeriod - 1) {
-      sma[i] = closeSum / smaPeriod;
-    }
-
-    if (i === 0) {
-      tr[i] = quotes[i].high - quotes[i].low;
-    } else {
-      const cur = quotes[i];
-      const prevClose = quotes[i - 1].close;
-      tr[i] = Math.max(
-        cur.high - cur.low,
-        Math.abs(cur.high - prevClose),
-        Math.abs(cur.low - prevClose)
-      );
-    }
-
-    if (i === atrPeriod) {
-      let trSum = 0;
-      for (let k = 1; k <= atrPeriod; k++) trSum += tr[k];
-      atr[i] = trSum / atrPeriod;
-    } else if (i > atrPeriod) {
-      atr[i] = (atr[i - 1] * (atrPeriod - 1) + tr[i]) / atrPeriod;
-    }
-  }
-
-  return quotes.map((q, i) => {
-    const hasBoth = sma[i] !== null && atr[i] !== null;
-    return {
-      date: q.date,
-      close: q.close,
-      low: q.low,
-      sma200: sma[i],
-      atr14: atr[i],
-      upperBuffer: hasBoth ? sma[i] + 2 * atr[i] : null,
-      rawLowerBuffer: hasBoth ? sma[i] - 2 * atr[i] : null
-    };
+// משיכת נתונים מ-Yahoo Finance
+async function fetchStockData(symbol) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1y&interval=1d`;
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0' }
   });
-}
 
-async function analyzeSymbol(symbol, { includeAllStatuses = false } = {}) {
-  const cleanSymbol = cleanEnglishText(symbol, '').toUpperCase();
-  if (!cleanSymbol) return null;
+  if (!res.ok) return null;
+  const data = await res.json();
+  const result = data?.chart?.result?.[0];
+  if (!result) return null;
 
-  // בדיקת Cache
-  const cached = symbolCache.get(cleanSymbol);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-    const data = cached.data;
-    if (!data) return null;
-    if (!includeAllStatuses && data.status !== 'פריצה' && data.status !== 'קרובה לפריצה') {
-      return null;
+  const meta = result.meta || {};
+  const quote = result.indicators?.quote?.[0];
+  if (!quote || !quote.close || quote.close.length < 205) return null;
+
+  const candles = [];
+  for (let i = 0; i < quote.close.length; i++) {
+    const close = quote.close[i];
+    const high = quote.high[i];
+    const low = quote.low[i];
+    if (close != null && high != null && low != null) {
+      candles.push({ close, high, low });
     }
-    return data;
   }
 
-  try {
-    const endDate = new Date();
-    const startDate = new Date();
-    startDate.setDate(endDate.getDate() - 420);
+  if (candles.length < 205) return null;
 
-    const chart = await yahooFinance.chart(cleanSymbol, {
-      period1: startDate.toISOString().split('T')[0],
-      interval: '1d'
-    });
+  return {
+    symbol,
+    name: meta.shortName || meta.longName || symbol,
+    candles
+  };
+}
 
-    const quotes = (chart?.quotes || []).filter(
-      q =>
-        q &&
-        q.date &&
-        typeof q.close === 'number' &&
-        typeof q.high === 'number' &&
-        typeof q.low === 'number'
+// חישוב ממוצע נע (SMA)
+function calculateSMA(values, period) {
+  if (values.length < period) return null;
+  const slice = values.slice(values.length - period);
+  const sum = slice.reduce((acc, v) => acc + v, 0);
+  return sum / period;
+}
+
+// חישוב ATR 14
+function calculateATR(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const curr = candles[i];
+    const prevClose = candles[i - 1].close;
+    const tr = Math.max(
+      curr.high - curr.low,
+      Math.abs(curr.high - prevClose),
+      Math.abs(curr.low - prevClose)
     );
-
-    if (quotes.length < 205) {
-      symbolCache.set(cleanSymbol, { timestamp: Date.now(), data: null });
-      return null;
-    }
-
-    const series = computeIndicatorsSeries(quotes, 200, 14);
-    const lastIdx = series.length - 1;
-    const latest = series[lastIdx];
-
-    if (!latest || latest.upperBuffer === null || latest.upperBuffer <= 0) {
-      symbolCache.set(cleanSymbol, { timestamp: Date.now(), data: null });
-      return null;
-    }
-
-    // סימולציית עסקאות TAO 2 על ההיסטוריה (תואם ל-strategy.position_size == 0 ב-TradingView)
-    let inPosition = false;
-    let entryIdx = null;
-    let trailStop = null;
-
-    for (let i = 1; i <= lastIdx; i++) {
-      const curr = series[i];
-      const prev = series[i - 1];
-      if (curr.upperBuffer === null || prev.upperBuffer === null) continue;
-
-      if (inPosition) {
-        if (curr.low <= trailStop) {
-          inPosition = false;
-          entryIdx = null;
-          trailStop = null;
-        } else {
-          trailStop = Math.max(trailStop, curr.rawLowerBuffer);
-        }
-      }
-
-      if (!inPosition && curr.close > curr.upperBuffer && prev.close <= prev.upperBuffer) {
-        inPosition = true;
-        entryIdx = i;
-        trailStop = curr.rawLowerBuffer;
-      }
-    }
-
-    const diffPercent = ((latest.close - latest.upperBuffer) / latest.upperBuffer) * 100;
-
-    let breakoutDate = null;
-    let breakoutDaysAgo = null;
-    let breakoutTradingDaysAgo = null;
-    const activeStop = inPosition && trailStop !== null ? trailStop : latest.rawLowerBuffer;
-
-    if (inPosition && entryIdx !== null) {
-      breakoutDate = formatDateYMD(series[entryIdx].date);
-      breakoutDaysAgo = calcCalendarDaysAgo(series[entryIdx].date);
-      breakoutTradingDaysAgo = lastIdx - entryIdx;
-    }
-
-    // סיווג סטטוס: פריצה נקייה = 0 עד 3 ימי מסחר וגם מרחק של עד 4% מעל הרמה
-    let status = 'ניטרלי';
-    if (
-      inPosition &&
-      breakoutTradingDaysAgo !== null &&
-      breakoutTradingDaysAgo <= 3 &&
-      diffPercent >= 0 &&
-      diffPercent <= 4
-    ) {
-      status = 'פריצה';
-    } else if (!inPosition && latest.close <= latest.upperBuffer && diffPercent >= -4 && diffPercent < 0) {
-      status = 'קרובה לפריצה';
-    } else if (inPosition) {
-      status = 'בעסקה פעילה (מעל הטווח)';
-    }
-
-    const riskPercent =
-      latest.close > 0 ? ((latest.close - activeStop) / latest.close) * 100 : 0;
-
-    const rawName = chart?.meta?.shortName || chart?.meta?.longName || cleanSymbol;
-    const englishName = cleanEnglishText(rawName, cleanSymbol);
-
-    const result = {
-      symbol: cleanSymbol,
-      name: englishName,
-      price: Number(latest.close.toFixed(2)),
-      breakoutLevel: Number(latest.upperBuffer.toFixed(2)),
-      diffPercent: Number(diffPercent.toFixed(2)),
-      stopLoss: Number(activeStop.toFixed(2)),
-      riskPercent: Number(riskPercent.toFixed(1)),
-      breakoutDate: status === 'פריצה' || includeAllStatuses ? breakoutDate : null,
-      breakoutDaysAgo: status === 'פריצה' || includeAllStatuses ? breakoutDaysAgo : null,
-      breakoutTradingDaysAgo: status === 'פריצה' || includeAllStatuses ? breakoutTradingDaysAgo : null,
-      isFreshToday: status === 'פריצה' && breakoutTradingDaysAgo === 0,
-      status
-    };
-
-    symbolCache.set(cleanSymbol, { timestamp: Date.now(), data: result });
-
-    if (!includeAllStatuses && status !== 'פריצה' && status !== 'קרובה לפריצה') {
-      return null;
-    }
-
-    return result;
-  } catch (err) {
-    console.error(`Failed to analyze ${cleanSymbol}:`, err.message);
-    return null;
+    trs.push(tr);
   }
+  const recent = trs.slice(trs.length - period);
+  return recent.reduce((acc, v) => acc + v, 0) / period;
 }
 
-// סריקה בקבוצות (Batches) למניעת Rate Limit מ-Yahoo Finance
-async function analyzeInBatches(symbols, batchSize = 5) {
+// ניתוח מניה לפי TAO 2
+function analyzeStock(stock) {
+  const { symbol, name, candles } = stock;
+  const closes = candles.map(c => c.close);
+
+  const last = candles[candles.length - 1];
+  const prev = candles[candles.length - 2];
+
+  const sma200 = calculateSMA(closes, 200);
+  const atr14 = calculateATR(candles, 14);
+  if (!sma200 || !atr14) return null;
+
+  // רמת פריצה: שיא של 20 ימי המסחר הקודמים (ללא היום האחרון)
+  const lookback = candles.slice(candles.length - 21, candles.length - 1);
+  const breakoutLevel = Math.max(...lookback.map(c => c.high));
+
+  // תנאי פריצה: מחיר מעל SMA 200 ומעל רמת הפריצה
+  const isBreakout = last.close > sma200 && last.close > breakoutLevel;
+  if (!isBreakout) return null;
+
+  // האם הפריצה טרייה מהיום האחרון
+  const isFresh = prev.close <= breakoutLevel;
+
+  // סטופ לוס: SMA 200 פחות 2 ATR
+  const stopLoss = Math.max(0.01, sma200 - 2 * atr14);
+  const riskPercent = Number((((last.close - stopLoss) / last.close) * 100).toFixed(1));
+
+  return {
+    symbol,
+    name,
+    price: last.close,
+    breakoutLevel,
+    sma200,
+    atr14,
+    stopLoss,
+    riskPercent,
+    isFresh
+  };
+}
+
+// הרצת סריקה על כל המניות
+async function runScan(symbols = SYMBOLS) {
   const results = [];
-  for (let i = 0; i < symbols.length; i += batchSize) {
-    const batch = symbols.slice(i, i + batchSize);
-    const batchResults = await Promise.all(batch.map(s => analyzeSymbol(s)));
-    results.push(...batchResults);
+  for (const symbol of symbols) {
+    try {
+      const stock = await fetchStockData(symbol);
+      if (!stock) continue;
+      const analysis = analyzeStock(stock);
+      if (analysis) results.push(analysis);
+    } catch (err) {
+      console.error(`Error scanning ${symbol}:`, err.message);
+    }
   }
-  return results.filter(Boolean);
+  return results;
 }
 
-// שליחת הודעה לבוט הטלגרם
+// שליחת הודעה לטלגרם
 async function sendTelegramMessage(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -263,7 +148,9 @@ async function sendTelegramMessage(text) {
     body: JSON.stringify({
       chat_id: chatId,
       text,
-      parse_mode: 'HTML'
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      disable_notification: false
     })
   });
 
@@ -273,139 +160,77 @@ async function sendTelegramMessage(text) {
   }
 }
 
-async function handleScan(symbolsInput, res) {
-  try {
-    const symbolsList =
-      Array.isArray(symbolsInput) && symbolsInput.length > 0
-        ? symbolsInput
-        : DEFAULT_SYMBOLS;
-
-    const uniqueSymbols = [
-      ...new Set(
-        symbolsList
-          .map(s => cleanEnglishText(s, '').toUpperCase())
-          .filter(Boolean)
-      )
-    ];
-
-    const filtered = await analyzeInBatches(uniqueSymbols, 5);
-
-    const breakout = filtered
-      .filter(item => item.status === 'פריצה')
-      .sort((a, b) => (a.breakoutTradingDaysAgo ?? 99) - (b.breakoutTradingDaysAgo ?? 99));
-
-    const nearBreakout = filtered
-      .filter(item => item.status === 'קרובה לפריצה')
-      .sort((a, b) => b.diffPercent - a.diffPercent);
-
-    res.json({
-      appName: 'אוהד מניות',
-      strategy: 'TAO 2',
-      updatedAt: new Date().toISOString(),
-      scannedCount: uniqueSymbols.length,
-      breakout,
-      nearBreakout
-    });
-  } catch (err) {
-    res.status(500).json({
-      error: 'שגיאה בביצוע הסריקה',
-      details: err.message
-    });
-  }
-}
-
-// נתיב בדיקת תקינות (שימושי גם ל-UptimeRobot כדי שהשרת לא יירדם)
+// דף הבית / בדיקת זמינות
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'TAO 2 Scanner', defaultSymbolsCount: DEFAULT_SYMBOLS.length });
+  res.send('TAO2 Scanner is running');
 });
 
-// סריקה מלאה (GET)
+// נתיב סריקה (JSON)
 app.get('/api/scan', async (req, res) => {
-  const fromQuery = req.query.symbols
-    ? String(req.query.symbols).split(',').map(s => s.trim()).filter(Boolean)
-    : DEFAULT_SYMBOLS;
-  await handleScan(fromQuery, res);
+  try {
+    const breakouts = await runScan();
+    res.json({ ok: true, count: breakouts.length, breakouts });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
-// סריקה מלאה (POST)
-app.post('/api/scan', async (req, res) => {
-  await handleScan(req.body?.symbols, res);
-});
-
-// נתיב התראות טלגרם אוטומטי (למשל: /api/alert?test=true לבדיקה)
+// נתיב התראות לטלגרם
 app.get('/api/alert', async (req, res) => {
   try {
+    // בדיקה ידנית מהירה
     if (req.query.test === 'true') {
-      await sendTelegramMessage('✅ <b>TAO2 Scanner</b> מחובר ועובד! ההתראות היומיות יגיעו לכאן.');
+      await sendTelegramMessage('<b>TAO 2</b>\nהודעת בדיקה — הבוט מחובר ועובד!');
       return res.json({ ok: true, message: 'Test alert sent!' });
     }
 
-    const fromQuery = req.query.symbols
-      ? String(req.query.symbols).split(',').map(s => s.trim()).filter(Boolean)
-      : DEFAULT_SYMBOLS;
-
-    const uniqueSymbols = [
-      ...new Set(fromQuery.map(s => cleanEnglishText(s, '').toUpperCase()).filter(Boolean))
-    ];
-
-    const filtered = await analyzeInBatches(uniqueSymbols, 5);
     const freshOnly = req.query.freshOnly === 'true';
+    let breakouts = await runScan();
 
-    const breakouts = filtered
-      .filter(item => item.status === 'פריצה' && (!freshOnly || item.isFreshToday))
-      .sort((a, b) => (a.breakoutTradingDaysAgo ?? 99) - (b.breakoutTradingDaysAgo ?? 99));
-
-    if (breakouts.length === 0) {
-      return res.json({ ok: true, sent: 0, message: 'No breakouts found' });
+    if (freshOnly) {
+      breakouts = breakouts.filter(b => b.isFresh);
     }
 
-    const lines = breakouts.map(s => {
-      const badge = s.isFreshToday ? '🔥 חדש היום' : `לפני ${s.breakoutTradingDaysAgo} ימי מסחר`;
-      return `🚀 <b>${s.symbol}</b> (${badge})\nמחיר: $${s.price} (+${s.diffPercent}%) | סטופ: $${s.stopLoss} (סיכון ${s.riskPercent}%)`;
+    if (breakouts.length === 0) {
+      await sendTelegramMessage('<b>TAO 2</b>\nאוהד ערב טוב, אין פריצה — אתה יכול לישון בשקט');
+      return res.json({ ok: true, sent: 0, message: 'No breakouts found (evening message sent)' });
+    }
+
+    const cards = breakouts.map(s => {
+      const safeName = String(s.name || s.symbol)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      const tvUrl = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(s.symbol)}`;
+
+      return [
+        '<blockquote>',
+        `<b>${s.symbol}</b> · ${safeName}`,
+        '',
+        `<b>מחיר</b> — $${s.price.toFixed(2)}`,
+        `<b>פריצה</b> — $${s.breakoutLevel.toFixed(2)}`,
+        `<b>סטופ</b> — $${s.stopLoss.toFixed(2)}`,
+        `<b>מרחק לסטופ</b> — ${s.riskPercent}%`,
+        '',
+        `<a href="${tvUrl}">פתח גרף ↗</a>`,
+        '</blockquote>'
+      ].join('\n');
     });
 
-    const message = `🔔 <b>פריצות TAO 2 (${breakouts.length}):</b>\n\n${lines.join('\n\n')}`;
+    const title = breakouts.length === 1
+      ? '<b>TAO 2 · פריצה חדשה</b>'
+      : `<b>TAO 2 · ${breakouts.length} פריצות חדשות</b>`;
+
+    const message = `${title}\n\n${cards.join('\n\n')}`;
     await sendTelegramMessage(message);
 
-    res.json({ ok: true, sent: breakouts.length, symbols: breakouts.map(b => b.symbol) });
+    res.json({ ok: true, sent: breakouts.length });
   } catch (err) {
     console.error('Alert error:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// בדיקה מהירה למניה בודדת (למשל: /api/check?symbol=QUBT)
-app.get('/api/check', async (req, res) => {
-  const symbol = req.query.symbol;
-  if (!symbol) {
-    return res.status(400).json({ error: 'נא לספק סימול מניה (symbol)' });
-  }
-  const result = await analyzeSymbol(symbol, { includeAllStatuses: true });
-  if (!result) {
-    return res.status(404).json({ error: `לא נמצאו מספיק נתונים עבור ${symbol}` });
-  }
-  res.json(result);
-});
-
-// חיפוש והשלמה אוטומטית למניות אמיתיות (למשל: /api/search?q=palantir)
-app.get('/api/search', async (req, res) => {
-  const q = String(req.query.q || '').trim();
-  if (q.length < 1) return res.json([]);
-  try {
-    const searchRes = await yahooFinance.search(q, { quotesCount: 6, newsCount: 0 });
-    const items = (searchRes?.quotes || [])
-      .filter(item => item.symbol && (item.quoteType === 'EQUITY' || item.quoteType === 'ETF'))
-      .map(item => ({
-        symbol: item.symbol,
-        name: cleanEnglishText(item.shortname || item.longname || item.symbol, item.symbol),
-        exchange: item.exchDisp || ''
-      }));
-    res.json(items);
-  } catch (err) {
-    res.json([]);
-  }
-});
-
 app.listen(PORT, () => {
-  console.log(`Ohad Stocks (TAO 2) server running on port ${PORT}`);
+  console.log(`TAO2 Scanner listening on port ${PORT}`);
 });
