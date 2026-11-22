@@ -248,6 +248,31 @@ async function analyzeInBatches(symbols, batchSize = 5) {
   return results.filter(Boolean);
 }
 
+// שליחת הודעה לבוט הטלגרם
+async function sendTelegramMessage(text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    throw new Error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
+  }
+
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      parse_mode: 'HTML'
+    })
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Telegram API error: ${errText}`);
+  }
+}
+
 async function handleScan(symbolsInput, res) {
   try {
     const symbolsList =
@@ -305,6 +330,48 @@ app.get('/api/scan', async (req, res) => {
 // סריקה מלאה (POST)
 app.post('/api/scan', async (req, res) => {
   await handleScan(req.body?.symbols, res);
+});
+
+// נתיב התראות טלגרם אוטומטי (למשל: /api/alert?test=true לבדיקה)
+app.get('/api/alert', async (req, res) => {
+  try {
+    if (req.query.test === 'true') {
+      await sendTelegramMessage('✅ <b>TAO2 Scanner</b> מחובר ועובד! ההתראות היומיות יגיעו לכאן.');
+      return res.json({ ok: true, message: 'Test alert sent!' });
+    }
+
+    const fromQuery = req.query.symbols
+      ? String(req.query.symbols).split(',').map(s => s.trim()).filter(Boolean)
+      : DEFAULT_SYMBOLS;
+
+    const uniqueSymbols = [
+      ...new Set(fromQuery.map(s => cleanEnglishText(s, '').toUpperCase()).filter(Boolean))
+    ];
+
+    const filtered = await analyzeInBatches(uniqueSymbols, 5);
+    const freshOnly = req.query.freshOnly === 'true';
+
+    const breakouts = filtered
+      .filter(item => item.status === 'פריצה' && (!freshOnly || item.isFreshToday))
+      .sort((a, b) => (a.breakoutTradingDaysAgo ?? 99) - (b.breakoutTradingDaysAgo ?? 99));
+
+    if (breakouts.length === 0) {
+      return res.json({ ok: true, sent: 0, message: 'No breakouts found' });
+    }
+
+    const lines = breakouts.map(s => {
+      const badge = s.isFreshToday ? '🔥 חדש היום' : `לפני ${s.breakoutTradingDaysAgo} ימי מסחר`;
+      return `🚀 <b>${s.symbol}</b> (${badge})\nמחיר: $${s.price} (+${s.diffPercent}%) | סטופ: $${s.stopLoss} (סיכון ${s.riskPercent}%)`;
+    });
+
+    const message = `🔔 <b>פריצות TAO 2 (${breakouts.length}):</b>\n\n${lines.join('\n\n')}`;
+    await sendTelegramMessage(message);
+
+    res.json({ ok: true, sent: breakouts.length, symbols: breakouts.map(b => b.symbol) });
+  } catch (err) {
+    console.error('Alert error:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // בדיקה מהירה למניה בודדת (למשל: /api/check?symbol=QUBT)
