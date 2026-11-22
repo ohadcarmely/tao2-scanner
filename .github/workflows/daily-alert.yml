@@ -1,0 +1,15 @@
+name: TAO2 Daily Alert
+
+on:
+  schedule:
+    # שני עד שישי ב-20:45 UTC (22:45 שעון חורף בישראל)
+    - cron: '45 20 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  trigger-alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake up Render & run TAO2 scan
+        run: |
+          curl -f --max-time 180 "https://tao2-scanner.onrender.com/api/alert?freshOnly=true"
