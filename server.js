@@ -39,30 +39,33 @@ async function fetchStockData(symbol) {
 
   const meta = result.meta || {};
   const quote = result.indicators?.quote?.[0];
-  if (!quote || !quote.close || quote.close.length < 205) return null;
+  const timestamps = result.timestamp || [];
+  if (!quote || !quote.close || quote.close.length < 30) return null;
 
   const candles = [];
   for (let i = 0; i < quote.close.length; i++) {
     const close = quote.close[i];
-    const high = quote.high[i];
-    const low = quote.low[i];
+    const high = quote.high?.[i];
+    const low = quote.low?.[i];
+    const ts = timestamps[i];
     if (close != null && high != null && low != null) {
-      candles.push({ close, high, low });
+      candles.push({ close, high, low, timestamp: ts });
     }
   }
 
-  if (candles.length < 205) return null;
+  if (candles.length < 30) return null;
 
   return {
     symbol,
     name: meta.shortName || meta.longName || symbol,
+    exchange: meta.exchangeName || meta.fullExchangeName || 'NASDAQ',
     candles
   };
 }
 
 // חישוב ממוצע נע (SMA)
 function calculateSMA(values, period) {
-  if (values.length < period) return null;
+  if (!values || values.length < period) return null;
   const slice = values.slice(values.length - period);
   const sum = slice.reduce((acc, v) => acc + v, 0);
   return sum / period;
@@ -70,7 +73,7 @@ function calculateSMA(values, period) {
 
 // חישוב ATR 14
 function calculateATR(candles, period = 14) {
-  if (candles.length < period + 1) return null;
+  if (!candles || candles.length < period + 1) return null;
   const trs = [];
   for (let i = 1; i < candles.length; i++) {
     const curr = candles[i];
@@ -86,47 +89,77 @@ function calculateATR(candles, period = 14) {
   return recent.reduce((acc, v) => acc + v, 0) / period;
 }
 
-// ניתוח מניה לפי TAO 2
-function analyzeStock(stock) {
+// ניתוח מניה מלא (כולל שדות עבור בדיקת מניה בודדת)
+function buildStockAnalysis(stock) {
   const { symbol, name, candles } = stock;
   const closes = candles.map(c => c.close);
 
   const last = candles[candles.length - 1];
-  const prev = candles[candles.length - 2];
+  const prev = candles[candles.length - 2] || last;
 
-  const sma200 = calculateSMA(closes, 200);
-  const atr14 = calculateATR(candles, 14);
-  if (!sma200 || !atr14) return null;
+  const smaPeriod = Math.min(200, closes.length);
+  const sma200 = calculateSMA(closes, smaPeriod) ?? last.close;
+  const atr14 = calculateATR(candles, 14) ?? Math.max(0.5, last.close * 0.02);
 
-  // רמת פריצה: שיא של 20 ימי המסחר הקודמים (ללא היום האחרון)
-  const lookback = candles.slice(candles.length - 21, candles.length - 1);
-  const breakoutLevel = Math.max(...lookback.map(c => c.high));
+  const lookbackStart = Math.max(0, candles.length - 21);
+  const lookbackEnd = Math.max(lookbackStart + 1, candles.length - 1);
+  const lookback = candles.slice(lookbackStart, lookbackEnd);
+  const breakoutLevel = lookback.length > 0
+    ? Math.max(...lookback.map(c => c.high))
+    : last.high;
 
-  // תנאי פריצה: מחיר מעל SMA 200 ומעל רמת הפריצה
-  const isBreakout = last.close > sma200 && last.close > breakoutLevel;
-  if (!isBreakout) return null;
-
-  // האם הפריצה טרייה מהיום האחרון
+  const isActiveBreakout = Boolean(last.close > sma200 && last.close > breakoutLevel);
   const isFresh = prev.close <= breakoutLevel;
 
-  // סטופ לוס: SMA 200 פחות 2 ATR
-  const stopLoss = Math.max(0.01, sma200 - 2 * atr14);
-  const riskPercent = Number((((last.close - stopLoss) / last.close) * 100).toFixed(1));
+  const rawStop = sma200 - 2 * atr14;
+  const stopLoss = Number(Math.max(0.01, rawStop).toFixed(2));
+  const riskPercent = last.close > 0
+    ? Number((((last.close - stopLoss) / last.close) * 100).toFixed(1))
+    : 0;
+
+  const diffPercent = breakoutLevel > 0
+    ? Number((((last.close - breakoutLevel) / breakoutLevel) * 100).toFixed(2))
+    : 0;
+
+  let breakoutDate = null;
+  let breakoutDaysAgo = null;
+  if (isActiveBreakout && last.timestamp) {
+    const d = new Date(last.timestamp * 1000);
+    breakoutDate = d.toISOString().slice(0, 10);
+    breakoutDaysAgo = 0;
+  }
+
+  const status = isActiveBreakout
+    ? (isFresh ? 'פריצה טרייה מעל SMA200' : 'פריצה פעילה מעל SMA200')
+    : (last.close > sma200 ? 'מעל SMA200 · ממתין לפריצת שיא 20 ימים' : 'מתחת ל-SMA200');
 
   return {
     symbol,
     name,
-    price: last.close,
-    breakoutLevel,
-    sma200,
-    atr14,
+    price: Number(last.close.toFixed(2)),
+    breakoutLevel: Number(breakoutLevel.toFixed(2)),
+    sma200: Number(sma200.toFixed(2)),
+    atr14: Number(atr14.toFixed(2)),
     stopLoss,
     riskPercent,
-    isFresh
+    diffPercent,
+    isBreakout: isActiveBreakout,
+    isActiveBreakout,
+    isFresh,
+    breakoutDate,
+    breakoutDaysAgo,
+    status
   };
 }
 
-// הרצת סריקה על כל המניות
+// ניתוח מניה לסריקה רגילה (מחזיר רק מניות בפריצה)
+function analyzeStock(stock) {
+  const analysis = buildStockAnalysis(stock);
+  if (!analysis.isActiveBreakout) return null;
+  return analysis;
+}
+
+// הרצת סריקה על רשימת מניות
 async function runScan(symbols = SYMBOLS) {
   const results = [];
   for (const symbol of symbols) {
@@ -174,6 +207,36 @@ app.get('/', (req, res) => {
   res.send('TAO2 Scanner is running');
 });
 
+// חיפוש מניות להשלמה אוטומטית (/api/search?q=...)
+app.get('/api/search', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (!q) return res.json([]);
+
+    const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0`;
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+
+    if (!response.ok) return res.json([]);
+    const data = await response.json();
+    const quotes = Array.isArray(data?.quotes) ? data.quotes : [];
+
+    const filtered = quotes
+      .filter(item => item.symbol && (item.quoteType === 'EQUITY' || item.quoteType === 'ETF'))
+      .map(item => ({
+        symbol: String(item.symbol).toUpperCase(),
+        name: item.shortname || item.longname || String(item.symbol).toUpperCase(),
+        exchange: item.exchDisp || item.exchange || 'US'
+      }));
+
+    res.json(filtered);
+  } catch (err) {
+    console.error('Search error:', err.message);
+    res.json([]);
+  }
+});
+
 // נתיב סריקה (GET)
 app.get('/api/scan', async (req, res) => {
   try {
@@ -211,37 +274,10 @@ async function handleSingleStock(req, res) {
       return res.status(404).json({ ok: false, error: 'Symbol not found' });
     }
 
-    const { name, candles } = stock;
-    const closes = candles.map(c => c.close);
-    const last = candles[candles.length - 1];
-    const prev = candles[candles.length - 2];
-
-    const sma200 = calculateSMA(closes, 200);
-    const atr14 = calculateATR(candles, 14);
-    const lookback = candles.slice(candles.length - 21, candles.length - 1);
-    const breakoutLevel = Math.max(...lookback.map(c => c.high));
-
-    const isBreakout = Boolean(sma200 && atr14 && last.close > sma200 && last.close > breakoutLevel);
-    const isFresh = prev.close <= breakoutLevel;
-    const stopLoss = sma200 && atr14 ? Math.max(0.01, sma200 - 2 * atr14) : null;
-    const riskPercent = stopLoss != null
-      ? Number((((last.close - stopLoss) / last.close) * 100).toFixed(1))
-      : null;
-
-    res.json({
-      ok: true,
-      symbol,
-      name,
-      price: last.close,
-      breakoutLevel,
-      sma200,
-      atr14,
-      stopLoss,
-      riskPercent,
-      isBreakout,
-      isFresh
-    });
+    const analysis = buildStockAnalysis(stock);
+    res.json(analysis);
   } catch (err) {
+    console.error('Single stock error:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
 }
