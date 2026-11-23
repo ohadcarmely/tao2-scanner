@@ -11,7 +11,7 @@ const MA_LENGTH = 200;
 const ATR_LENGTH = 14;
 const ATR_MULT = 2.0;
 const NEAR_BREAKOUT_THRESHOLD_PCT = -3.0; // עד 3% מתחת ל-upperBuffer
-const BREAKOUT_WINDOW_DAYS = 3; // חלון פריצות פעילות בממשק (0..3 ימים)
+const BREAKOUT_WINDOW_DAYS = 3; // חלון פריצות פעילות בממשק (היום + 3 ימים אחרונים)
 const BATCH_SIZE = 8;
 const BATCH_DELAY_MS = 250;
 
@@ -94,7 +94,7 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// משיכת נתוני נרות יומיים (שנתיים אחורה כדי של-SMA200 ול-Trailing Stop תהיה היסטוריה מלאה)
+// משיכת נתוני נרות יומיים + הזרקת המחיר החי של הרגע (הווה)
 async function fetchStockData(symbol) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=2y&interval=1d`;
   const res = await fetch(url, {
@@ -130,6 +130,29 @@ async function fetchStockData(symbol) {
   }
 
   if (candles.length < 30) return null;
+
+  // הזרקת המחיר החי (הווה) לנר היומי כדי לתפוס פריצות בזמן אמת במהלך יום המסחר
+  const regularPrice = meta.regularMarketPrice;
+  const regularTime = meta.regularMarketTime;
+  if (regularPrice != null && candles.length > 0) {
+    const lastCandle = candles[candles.length - 1];
+    const lastDay = lastCandle.timestamp ? Math.floor(lastCandle.timestamp / 86400) : null;
+    const marketDay = regularTime ? Math.floor(regularTime / 86400) : null;
+
+    if (lastDay !== null && marketDay !== null && marketDay > lastDay) {
+      candles.push({
+        open: regularPrice,
+        high: regularPrice,
+        low: regularPrice,
+        close: regularPrice,
+        timestamp: regularTime
+      });
+    } else {
+      lastCandle.close = regularPrice;
+      if (regularPrice > lastCandle.high) lastCandle.high = regularPrice;
+      if (regularPrice < lastCandle.low) lastCandle.low = regularPrice;
+    }
+  }
 
   return {
     symbol,
@@ -204,7 +227,6 @@ function buildStockAnalysis(stock, forSingleCheck = false) {
   const { symbol, name, candles } = stock;
   const closes = candles.map(c => c.close);
 
-  // אם למניה חדשה יש פחות מ-200 נרות, נשתמש באורך הזמין
   const effectiveMaLen = Math.min(MA_LENGTH, closes.length);
   const smaSeries = calculateSMASeries(closes, effectiveMaLen);
   const atrSeries = calculateATRSeries(candles, ATR_LENGTH);
@@ -263,7 +285,8 @@ function buildStockAnalysis(stock, forSingleCheck = false) {
     ? formatDateDDMMYYYY(candles[entryIndex].timestamp)
     : null;
 
-  const isFresh = inPosition && breakoutDaysAgo === 0;
+  // isFresh = פריצה חיה מהיום (breakoutDaysAgo === 0)
+  const isFresh = Boolean(inPosition && breakoutDaysAgo === 0);
   const isRecentBreakout = Boolean(
     inPosition &&
     breakoutDaysAgo !== null &&
@@ -289,7 +312,7 @@ function buildStockAnalysis(stock, forSingleCheck = false) {
     : 0;
 
   const hebrewStatus = isRecentBreakout
-    ? (isFresh ? 'פריצה טרייה · TAO 2' : `פריצה פעילה (לפני ${breakoutDaysAgo} ימים)`)
+    ? (isFresh ? 'פורצת עכשיו · היום (TAO 2)' : `פריצה פעילה (לפני ${breakoutDaysAgo} ימים)`)
     : inPosition
       ? 'בעסקת פריצה פעילה (מעל 3 ימים)'
       : isNearBreakout
@@ -363,7 +386,7 @@ async function runScan(symbols = []) {
     }
   }
 
-  // מיון: פריצות הכי טריות קודם, וקרוב לפריצה הכי קרוב ל-0% קודם
+  // מיון: פריצות מהיום (breakoutDaysAgo === 0) קודם, אחריהן 1..3 ימים, וקרוב לפריצה הכי קרוב ל-0% קודם
   breakouts.sort((a, b) => (a.breakoutDaysAgo ?? 99) - (b.breakoutDaysAgo ?? 99));
   nearBreakouts.sort((a, b) => b.diffPercent - a.diffPercent);
 
@@ -399,7 +422,7 @@ async function sendTelegramMessage(text) {
 
 // דף הבית ובדיקת תקינות (להתעוררות מהירה ב-Render)
 app.get('/', (req, res) => {
-  res.send('TAO2 Scanner is running (100 stocks · SMA200 + 2*ATR14)');
+  res.send('TAO2 Scanner is running (100 stocks · Live Intraday + SMA200 + 2*ATR14)');
 });
 
 app.get('/health', (req, res) => {
@@ -551,7 +574,7 @@ app.get('/api/stock', handleSingleStock);
 app.get('/api/alert', async (req, res) => {
   try {
     if (req.query.test === 'true') {
-      await sendTelegramMessage('<b>TAO 2</b>\nהודעת בדיקה — הבוט מחובר וסורק 100 מניות!');
+      await sendTelegramMessage('<b>TAO 2</b>\nהודעת בדיקה — הבוט מחובר וסורק 100 מניות בזמן אמת!');
       return res.json({ ok: true, message: 'Test alert sent!' });
     }
 
@@ -576,7 +599,7 @@ app.get('/api/alert', async (req, res) => {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
       const tvUrl = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(s.symbol)}`;
-      const freshTag = s.isFresh ? ' · טרייה מהיום' : (s.breakoutDaysAgo ? ` · לפני ${s.breakoutDaysAgo} ימים` : '');
+      const freshTag = s.isFresh ? ' · פורצת היום' : (s.breakoutDaysAgo ? ` · לפני ${s.breakoutDaysAgo} ימים` : '');
 
       return [
         '<blockquote>',
