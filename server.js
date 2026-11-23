@@ -6,36 +6,64 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const CUSTOM_SYMBOLS_FILE = path.join(__dirname, 'custom-symbols.json');
 
+// פרמטרים של אסטרטגיית TAO 2
+const MA_LENGTH = 200;
+const ATR_LENGTH = 14;
+const ATR_MULT = 2.0;
+const NEAR_BREAKOUT_THRESHOLD_PCT = -3.0; // עד 3% מתחת ל-upperBuffer
+const BREAKOUT_WINDOW_DAYS = 3; // חלון פריצות פעילות בממשק (0..3 ימים)
+const BATCH_SIZE = 8;
+const BATCH_DELAY_MS = 250;
+
 app.use(express.json());
 
 // אישור CORS לחיבור מ-Google AI Studio ומדפדפנים חיצוניים
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Accept');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
 app.use(express.static(__dirname));
 
-// רשימת המניות הבסיסית לסריקה
+// רשימת 100 המניות המעודכנות לסריקה
 const DEFAULT_SYMBOLS = [
-  'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'TSLA', 'AVGO', 'COST', 'NFLX',
-  'AMD', 'QCOM', 'TXN', 'INTU', 'AMAT', 'MU', 'LRCX', 'KLAC', 'SNPS', 'CDNS',
-  'ADBE', 'CRM', 'ORCL', 'PANW', 'CRWD', 'PLTR', 'SNOW', 'DDOG', 'NET', 'ZS',
-  'ISRG', 'VRTX', 'REGN', 'GILD', 'AMGN', 'MRNA', 'PEP', 'SBUX', 'MDLZ', 'MNST',
-  'BKNG', 'ABNB', 'UBER', 'DASH', 'PYPL', 'COIN', 'TTWO', 'EA', 'IONQ', 'QUBT'
+  // 1. ביג טק ו-AI (10)
+  'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'TSLA', 'ORCL', 'IBM', 'PLTR',
+  // 2. שבבים וחומרה (12)
+  'AVGO', 'AMD', 'ARM', 'TSM', 'QCOM', 'TXN', 'AMAT', 'MU', 'LRCX', 'KLAC', 'ASML', 'SMCI',
+  // 3. סייבר, תוכנה וענן (12)
+  'PANW', 'CRWD', 'CHKP', 'FTNT', 'ZS', 'NET', 'DDOG', 'SNOW', 'CRM', 'ADBE', 'INTU', 'NOW',
+  // 4. גיימינג, מדיה ואינטרנט (10)
+  'NFLX', 'TTWO', 'EA', 'SPOT', 'UBER', 'DASH', 'ABNB', 'BKNG', 'APP', 'RBLX',
+  // 5. פיננסים, פינטק וקריפטו (10)
+  'JPM', 'GS', 'V', 'MA', 'AXP', 'BLK', 'PYPL', 'COIN', 'HOOD', 'IBIT',
+  // 6. צרכנות וקמעונאות (10)
+  'ORLY', 'COST', 'WMT', 'HD', 'LOW', 'MCD', 'SBUX', 'NKE', 'LULU', 'CMG',
+  // 7. בריאות, פארמה וביוטק (10)
+  'LLY', 'NVO', 'UNH', 'ISRG', 'VRTX', 'REGN', 'AMGN', 'GILD', 'SYK', 'TMO',
+  // 8. תעשייה, ביטחון וחלל (10)
+  'LMT', 'RTX', 'NOC', 'GE', 'CAT', 'DE', 'URI', 'CTAS', 'RKLB', 'ASTS',
+  // 9. אנרגיה, תשתיות וחשמל ל-AI (8)
+  'XOM', 'CVX', 'CEG', 'VST', 'NEE', 'ETN', 'VRT', 'GEV',
+  // 10. צמיחה, קוונטים ומומנטום (8)
+  'IONQ', 'QUBT', 'RGTI', 'SOFI', 'SHOP', 'MELI', 'DUOL', 'AXON'
 ];
 
-// טעינה ושמירה של מניות שנוספו ידנית
+// עזרי טעינה ושמירה של מניות ידניות
+function normalizeSymbol(s) {
+  return String(s || '').trim().toUpperCase();
+}
+
 function loadCustomSymbols() {
   try {
     if (!fs.existsSync(CUSTOM_SYMBOLS_FILE)) return [];
     const raw = fs.readFileSync(CUSTOM_SYMBOLS_FILE, 'utf8');
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed)
-      ? parsed.map(s => String(s).trim().toUpperCase()).filter(Boolean)
+      ? parsed.map(normalizeSymbol).filter(Boolean)
       : [];
   } catch {
     return [];
@@ -44,7 +72,7 @@ function loadCustomSymbols() {
 
 function saveCustomSymbols(list) {
   try {
-    const unique = [...new Set(list.map(s => String(s).trim().toUpperCase()).filter(Boolean))];
+    const unique = [...new Set(list.map(normalizeSymbol).filter(Boolean))];
     fs.writeFileSync(CUSTOM_SYMBOLS_FILE, JSON.stringify(unique, null, 2), 'utf8');
     return unique;
   } catch (err) {
@@ -58,13 +86,17 @@ function getAllSymbols(extraSymbols = []) {
   return [...new Set([
     ...DEFAULT_SYMBOLS,
     ...custom,
-    ...extraSymbols.map(s => String(s).trim().toUpperCase()).filter(Boolean)
+    ...extraSymbols.map(normalizeSymbol).filter(Boolean)
   ])];
 }
 
-// משיכת נתונים מ-Yahoo Finance
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// משיכת נתוני נרות יומיים (שנתיים אחורה כדי של-SMA200 ול-Trailing Stop תהיה היסטוריה מלאה)
 async function fetchStockData(symbol) {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1y&interval=1d`;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=2y&interval=1d`;
   const res = await fetch(url, {
     headers: { 'User-Agent': 'Mozilla/5.0' }
   });
@@ -84,9 +116,16 @@ async function fetchStockData(symbol) {
     const close = quote.close[i];
     const high = quote.high?.[i];
     const low = quote.low?.[i];
+    const open = quote.open?.[i];
     const ts = timestamps[i];
     if (close != null && high != null && low != null) {
-      candles.push({ close, high, low, timestamp: ts });
+      candles.push({
+        open: open ?? close,
+        high,
+        low,
+        close,
+        timestamp: ts
+      });
     }
   }
 
@@ -95,131 +134,238 @@ async function fetchStockData(symbol) {
   return {
     symbol,
     name: meta.shortName || meta.longName || symbol,
-    exchange: meta.exchangeName || meta.fullExchangeName || 'NASDAQ',
+    exchange: meta.exchangeName || meta.fullExchangeName || 'US',
     candles
   };
 }
 
-// חישוב ממוצע נע (SMA)
-function calculateSMA(values, period) {
-  if (!values || values.length < period) return null;
-  const slice = values.slice(values.length - period);
-  const sum = slice.reduce((acc, v) => acc + v, 0);
-  return sum / period;
+// חישוב סדרת SMA לכל נר
+function calculateSMASeries(closes, period) {
+  const result = new Array(closes.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < closes.length; i++) {
+    sum += closes[i];
+    if (i >= period) {
+      sum -= closes[i - period];
+    }
+    if (i >= period - 1) {
+      result[i] = sum / period;
+    }
+  }
+  return result;
 }
 
-// חישוב ATR 14
-function calculateATR(candles, period = 14) {
-  if (!candles || candles.length < period + 1) return null;
-  const trs = [];
+// חישוב סדרת ATR (Wilder RMA - זהה ל-ta.atr ב-TradingView)
+function calculateATRSeries(candles, period = ATR_LENGTH) {
+  const result = new Array(candles.length).fill(null);
+  if (candles.length < period + 1) return result;
+
+  const trs = new Array(candles.length).fill(0);
+  trs[0] = candles[0].high - candles[0].low;
   for (let i = 1; i < candles.length; i++) {
     const curr = candles[i];
     const prevClose = candles[i - 1].close;
-    const tr = Math.max(
+    trs[i] = Math.max(
       curr.high - curr.low,
       Math.abs(curr.high - prevClose),
       Math.abs(curr.low - prevClose)
     );
-    trs.push(tr);
   }
-  const recent = trs.slice(trs.length - period);
-  return recent.reduce((acc, v) => acc + v, 0) / period;
+
+  // ממוצע ראשוני של period נרות
+  let rma = 0;
+  for (let i = 0; i < period; i++) {
+    rma += trs[i];
+  }
+  rma /= period;
+  result[period - 1] = rma;
+
+  // החלקת Wilder (RMA)
+  for (let i = period; i < candles.length; i++) {
+    rma = ((rma * (period - 1)) + trs[i]) / period;
+    result[i] = rma;
+  }
+
+  return result;
 }
 
-// ניתוח מניה מלא
-function buildStockAnalysis(stock) {
+// פורמט תאריך DD/MM/YYYY תואם לממשק
+function formatDateDDMMYYYY(unixSeconds) {
+  if (!unixSeconds) return null;
+  const d = new Date(unixSeconds * 1000);
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const yyyy = d.getUTCFullYear();
+  return `${dd}/${mm}/${yyyy}`;
+}
+
+// ניתוח מניה לפי אלגוריתם TAO 2 המדויק
+function buildStockAnalysis(stock, forSingleCheck = false) {
   const { symbol, name, candles } = stock;
   const closes = candles.map(c => c.close);
 
-  const last = candles[candles.length - 1];
-  const prev = candles[candles.length - 2] || last;
+  // אם למניה חדשה יש פחות מ-200 נרות, נשתמש באורך הזמין
+  const effectiveMaLen = Math.min(MA_LENGTH, closes.length);
+  const smaSeries = calculateSMASeries(closes, effectiveMaLen);
+  const atrSeries = calculateATRSeries(candles, ATR_LENGTH);
 
-  const smaPeriod = Math.min(200, closes.length);
-  const sma200 = calculateSMA(closes, smaPeriod) ?? last.close;
-  const atr14 = calculateATR(candles, 14) ?? Math.max(0.5, last.close * 0.02);
+  // סימולציה היסטורית של כניסה וסטופ נגרר בדיוק כמו ב-Pine Script של TAO 2
+  let inPosition = false;
+  let trailStop = null;
+  let entryIndex = null;
 
-  const lookbackStart = Math.max(0, candles.length - 21);
-  const lookbackEnd = Math.max(lookbackStart + 1, candles.length - 1);
-  const lookback = candles.slice(lookbackStart, lookbackEnd);
-  const breakoutLevel = lookback.length > 0
-    ? Math.max(...lookback.map(c => c.high))
-    : last.high;
+  for (let i = 1; i < candles.length; i++) {
+    const ma = smaSeries[i];
+    const atr = atrSeries[i];
+    const prevMa = smaSeries[i - 1];
+    const prevAtr = atrSeries[i - 1];
 
-  const isActiveBreakout = Boolean(last.close > sma200 && last.close > breakoutLevel);
-  const isFresh = prev.close <= breakoutLevel;
+    if (ma == null || atr == null || prevMa == null || prevAtr == null) continue;
 
-  const diffPercent = breakoutLevel > 0
-    ? Number((((last.close - breakoutLevel) / breakoutLevel) * 100).toFixed(2))
+    const upperBuffer = ma + atr * ATR_MULT;
+    const rawLowerBuffer = ma - atr * ATR_MULT;
+    const prevUpperBuffer = prevMa + prevAtr * ATR_MULT;
+
+    const curr = candles[i];
+    const prev = candles[i - 1];
+
+    // בדיקת יציאה בסטופ אם יש עסקה פתוחה
+    if (inPosition) {
+      if (trailStop != null && curr.low <= trailStop) {
+        inPosition = false;
+        trailStop = null;
+        entryIndex = null;
+      } else {
+        trailStop = trailStop == null ? rawLowerBuffer : Math.max(trailStop, rawLowerBuffer);
+      }
+    }
+
+    // כניסה חדשה רק כשאין עסקה פתוחה: ta.crossover(close, upperBuffer)
+    const crossAbove = prev.close <= prevUpperBuffer && curr.close > upperBuffer;
+    if (!inPosition && crossAbove) {
+      inPosition = true;
+      trailStop = rawLowerBuffer;
+      entryIndex = i;
+    }
+  }
+
+  const lastIdx = candles.length - 1;
+  const last = candles[lastIdx];
+  const lastMa = smaSeries[lastIdx] ?? last.close;
+  const lastAtr = atrSeries[lastIdx] ?? Math.max(0.5, last.close * 0.02);
+
+  const upperBuffer = lastMa + lastAtr * ATR_MULT;
+  const rawLowerBuffer = lastMa - lastAtr * ATR_MULT;
+  const activeTrailStop = inPosition && trailStop != null ? trailStop : rawLowerBuffer;
+
+  const breakoutDaysAgo = inPosition && entryIndex !== null ? (lastIdx - entryIndex) : null;
+  const breakoutDate = inPosition && entryIndex !== null
+    ? formatDateDDMMYYYY(candles[entryIndex].timestamp)
+    : null;
+
+  const isFresh = inPosition && breakoutDaysAgo === 0;
+  const isRecentBreakout = Boolean(
+    inPosition &&
+    breakoutDaysAgo !== null &&
+    breakoutDaysAgo <= BREAKOUT_WINDOW_DAYS &&
+    last.close > upperBuffer
+  );
+
+  const diffPercent = upperBuffer > 0
+    ? Number((((last.close - upperBuffer) / upperBuffer) * 100).toFixed(2))
     : 0;
 
-  // קרוב לפריצה: מעל SMA200 ובטווח של עד 3% מתחת לרמת הפריצה
+  // קרוב לפריצה: עדיין לא בעסקה/לא מעל ה-upperBuffer, ובמרחק של עד 3% מתחתיו
   const isNearBreakout = Boolean(
-    !isActiveBreakout &&
-    last.close > sma200 &&
-    diffPercent >= -3 &&
+    !isRecentBreakout &&
+    last.close <= upperBuffer &&
+    diffPercent >= NEAR_BREAKOUT_THRESHOLD_PCT &&
     diffPercent < 0
   );
 
-  const rawStop = sma200 - 2 * atr14;
-  const stopLoss = Number(Math.max(0.01, rawStop).toFixed(2));
+  const stopLoss = Number(Math.max(0.01, activeTrailStop).toFixed(2));
   const riskPercent = last.close > 0
     ? Number((((last.close - stopLoss) / last.close) * 100).toFixed(1))
     : 0;
 
-  let breakoutDate = null;
-  let breakoutDaysAgo = null;
-  if (isActiveBreakout && last.timestamp) {
-    const d = new Date(last.timestamp * 1000);
-    breakoutDate = d.toISOString().slice(0, 10);
-    breakoutDaysAgo = 0;
-  }
+  const hebrewStatus = isRecentBreakout
+    ? (isFresh ? 'פריצה טרייה · TAO 2' : `פריצה פעילה (לפני ${breakoutDaysAgo} ימים)`)
+    : inPosition
+      ? 'בעסקת פריצה פעילה (מעל 3 ימים)'
+      : isNearBreakout
+        ? 'קרוב לפריצה · מתקרב ל-Upper Buffer'
+        : (last.close > lastMa ? 'מעל SMA200 · ממתין לחציית Upper Buffer' : 'מתחת ל-SMA200');
 
-  const status = isActiveBreakout
-    ? (isFresh ? 'פריצה טרייה מעל SMA200' : 'פריצה פעילה מעל SMA200')
+  const enumStatus = isRecentBreakout
+    ? 'BREAKOUT'
     : isNearBreakout
-      ? 'קרוב לפריצה · מעל SMA200'
-      : (last.close > sma200 ? 'מעל SMA200 · ממתין לפריצת שיא 20 ימים' : 'מתחת ל-SMA200');
+      ? 'NEAR_BREAKOUT'
+      : 'OTHER';
 
   return {
     symbol,
     name,
     price: Number(last.close.toFixed(2)),
-    breakoutLevel: Number(breakoutLevel.toFixed(2)),
-    sma200: Number(sma200.toFixed(2)),
-    atr14: Number(atr14.toFixed(2)),
+    breakoutLevel: Number(upperBuffer.toFixed(2)),
+    upperBuffer: Number(upperBuffer.toFixed(2)),
+    rawLowerBuffer: Number(Math.max(0.01, rawLowerBuffer).toFixed(2)),
+    trailStop: stopLoss,
     stopLoss,
+    sma200: Number(lastMa.toFixed(2)),
+    atr14: Number(lastAtr.toFixed(2)),
     riskPercent,
     diffPercent,
-    isBreakout: isActiveBreakout,
-    isActiveBreakout,
+    isBreakout: isRecentBreakout,
+    isActiveBreakout: isRecentBreakout,
+    isInPosition: inPosition,
     isNearBreakout,
     isFresh,
-    breakoutDate,
-    breakoutDaysAgo,
-    status
+    breakoutDate: isRecentBreakout ? breakoutDate : null,
+    breakoutDaysAgo: isRecentBreakout ? breakoutDaysAgo : null,
+    status: forSingleCheck ? hebrewStatus : enumStatus,
+    statusLabel: hebrewStatus
   };
 }
 
-// הרצת סריקה — מחזירה פריצות פעילות וגם מניות קרוב לפריצה (עד 3%)
+// הרצת סריקה ב-Batches מקבילים (מהיר ויציב ל-100+ מניות)
 async function runScan(symbols = []) {
   const targetList = getAllSymbols(symbols);
   const breakouts = [];
   const nearBreakouts = [];
 
-  for (const symbol of targetList) {
-    try {
-      const stock = await fetchStockData(symbol);
-      if (!stock) continue;
-      const analysis = buildStockAnalysis(stock);
+  for (let i = 0; i < targetList.length; i += BATCH_SIZE) {
+    const batch = targetList.slice(i, i + BATCH_SIZE);
+
+    const results = await Promise.all(
+      batch.map(async (symbol) => {
+        try {
+          const stock = await fetchStockData(symbol);
+          if (!stock) return null;
+          return buildStockAnalysis(stock, false);
+        } catch (err) {
+          console.error(`Error scanning ${symbol}:`, err.message);
+          return null;
+        }
+      })
+    );
+
+    for (const analysis of results) {
+      if (!analysis) continue;
       if (analysis.isActiveBreakout) {
         breakouts.push(analysis);
       } else if (analysis.isNearBreakout) {
         nearBreakouts.push(analysis);
       }
-    } catch (err) {
-      console.error(`Error scanning ${symbol}:`, err.message);
+    }
+
+    if (i + BATCH_SIZE < targetList.length) {
+      await sleep(BATCH_DELAY_MS);
     }
   }
+
+  // מיון: פריצות הכי טריות קודם, וקרוב לפריצה הכי קרוב ל-0% קודם
+  breakouts.sort((a, b) => (a.breakoutDaysAgo ?? 99) - (b.breakoutDaysAgo ?? 99));
+  nearBreakouts.sort((a, b) => b.diffPercent - a.diffPercent);
 
   return { breakouts, nearBreakouts, scannedCount: targetList.length };
 }
@@ -251,12 +397,16 @@ async function sendTelegramMessage(text) {
   }
 }
 
-// דף הבית
+// דף הבית ובדיקת תקינות (להתעוררות מהירה ב-Render)
 app.get('/', (req, res) => {
-  res.send('TAO2 Scanner is running');
+  res.send('TAO2 Scanner is running (100 stocks · SMA200 + 2*ATR14)');
 });
 
-// ניהול מניות ידניות (הוספה / צפייה / הסרה)
+app.get('/health', (req, res) => {
+  res.json({ ok: true, symbolsCount: getAllSymbols().length, time: new Date().toISOString() });
+});
+
+// ניהול מניות ידניות (צפייה / הוספה / הסרה)
 app.get('/api/watchlist', (req, res) => {
   res.json({
     ok: true,
@@ -271,7 +421,7 @@ app.post('/api/watchlist', (req, res) => {
     ? req.body.symbols
     : (req.body?.symbol ? [req.body.symbol] : []);
 
-  const normalized = incoming.map(s => String(s).trim().toUpperCase()).filter(Boolean);
+  const normalized = incoming.map(normalizeSymbol).filter(Boolean);
   if (normalized.length === 0) {
     return res.status(400).json({ ok: false, error: 'Missing symbol' });
   }
@@ -282,7 +432,7 @@ app.post('/api/watchlist', (req, res) => {
 });
 
 app.delete('/api/watchlist/:symbol', (req, res) => {
-  const target = String(req.params.symbol || '').trim().toUpperCase();
+  const target = normalizeSymbol(req.params.symbol);
   const current = loadCustomSymbols().filter(s => s !== target);
   const updated = saveCustomSymbols(current);
   res.json({ ok: true, customSymbols: updated, allSymbols: getAllSymbols() });
@@ -306,8 +456,8 @@ app.get('/api/search', async (req, res) => {
     const filtered = quotes
       .filter(item => item.symbol && (item.quoteType === 'EQUITY' || item.quoteType === 'ETF'))
       .map(item => ({
-        symbol: String(item.symbol).toUpperCase(),
-        name: item.shortname || item.longname || String(item.symbol).toUpperCase(),
+        symbol: normalizeSymbol(item.symbol),
+        name: item.shortname || item.longname || normalizeSymbol(item.symbol),
         exchange: item.exchDisp || item.exchange || 'US'
       }));
 
@@ -318,44 +468,53 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
+// עזר לבניית תשובת סריקה תואמת לכל השדות שהממשק מצפה להם
+function buildScanResponse(breakouts, nearBreakouts, scannedCount) {
+  return {
+    ok: true,
+    updatedAt: new Date().toISOString(),
+    count: breakouts.length,
+    nearCount: nearBreakouts.length,
+    scannedCount,
+    // מפתחות ביחיד (תואם stockLogic.ts)
+    breakout: breakouts,
+    nearBreakout: nearBreakouts,
+    // מפתחות ברבים (לתאימות לאחור)
+    breakouts,
+    nearBreakouts
+  };
+}
+
 // נתיב סריקה (GET)
 app.get('/api/scan', async (req, res) => {
   try {
-    const { breakouts, nearBreakouts, scannedCount } = await runScan();
-    res.json({
-      ok: true,
-      count: breakouts.length,
-      nearCount: nearBreakouts.length,
-      scannedCount,
-      breakouts,
-      nearBreakouts
-    });
+    const querySymbols = req.query.symbols
+      ? String(req.query.symbols).split(',').map(normalizeSymbol).filter(Boolean)
+      : [];
+    const { breakouts, nearBreakouts, scannedCount } = await runScan(querySymbols);
+    res.json(buildScanResponse(breakouts, nearBreakouts, scannedCount));
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// נתיב סריקה (POST - קולט כל מניה שהוספת ידנית באפליקציה וסורק אותה)
+// נתיב סריקה (POST - קולט גם מניות שנוספו ידנית מהאפליקציה)
 app.post('/api/scan', async (req, res) => {
   try {
     const manualSymbols = Array.isArray(req.body?.symbols)
-      ? req.body.symbols.map(s => String(s).trim().toUpperCase()).filter(Boolean)
+      ? req.body.symbols.map(normalizeSymbol).filter(Boolean)
       : [];
 
-    // אם האפליקציה שולחת את הרשימה הידנית שלה, נשמור אותה גם כרשימה הידנית הפעילה
-    if (Array.isArray(req.body?.symbols)) {
-      saveCustomSymbols(manualSymbols);
+    if (manualSymbols.length > 0) {
+      const extraOnly = manualSymbols.filter(s => !DEFAULT_SYMBOLS.includes(s));
+      if (extraOnly.length > 0) {
+        const current = loadCustomSymbols();
+        saveCustomSymbols([...current, ...extraOnly]);
+      }
     }
 
     const { breakouts, nearBreakouts, scannedCount } = await runScan(manualSymbols);
-    res.json({
-      ok: true,
-      count: breakouts.length,
-      nearCount: nearBreakouts.length,
-      scannedCount,
-      breakouts,
-      nearBreakouts
-    });
+    res.json(buildScanResponse(breakouts, nearBreakouts, scannedCount));
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -365,7 +524,7 @@ app.post('/api/scan', async (req, res) => {
 async function handleSingleStock(req, res) {
   try {
     const rawSymbol = req.params.symbol || req.query.symbol || req.body?.symbol || '';
-    const symbol = String(rawSymbol).trim().toUpperCase();
+    const symbol = normalizeSymbol(rawSymbol);
     if (!symbol) {
       return res.status(400).json({ ok: false, error: 'Missing symbol' });
     }
@@ -375,7 +534,7 @@ async function handleSingleStock(req, res) {
       return res.status(404).json({ ok: false, error: 'Symbol not found' });
     }
 
-    const analysis = buildStockAnalysis(stock);
+    const analysis = buildStockAnalysis(stock, true);
     res.json(analysis);
   } catch (err) {
     console.error('Single stock error:', err);
@@ -392,21 +551,23 @@ app.get('/api/stock', handleSingleStock);
 app.get('/api/alert', async (req, res) => {
   try {
     if (req.query.test === 'true') {
-      await sendTelegramMessage('<b>TAO 2</b>\nהודעת בדיקה — הבוט מחובר ועובד!');
+      await sendTelegramMessage('<b>TAO 2</b>\nהודעת בדיקה — הבוט מחובר וסורק 100 מניות!');
       return res.json({ ok: true, message: 'Test alert sent!' });
     }
 
     const freshOnly = req.query.freshOnly === 'true';
-    const { breakouts: allBreakouts } = await runScan();
-    let breakouts = allBreakouts;
-
-    if (freshOnly) {
-      breakouts = breakouts.filter(b => b.isFresh);
-    }
+    const { breakouts: allBreakouts, nearBreakouts, scannedCount } = await runScan();
+    const breakouts = freshOnly ? allBreakouts.filter(b => b.isFresh) : allBreakouts;
 
     if (breakouts.length === 0) {
       await sendTelegramMessage('<b>TAO 2</b>\nאוהד ערב טוב, אין פריצה — אתה יכול לישון בשקט');
-      return res.json({ ok: true, sent: 0, message: 'No breakouts found (evening message sent)' });
+      return res.json({
+        ok: true,
+        sent: 0,
+        scannedCount,
+        nearCount: nearBreakouts.length,
+        message: 'No breakouts found (evening message sent)'
+      });
     }
 
     const cards = breakouts.map(s => {
@@ -415,14 +576,15 @@ app.get('/api/alert', async (req, res) => {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
       const tvUrl = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(s.symbol)}`;
+      const freshTag = s.isFresh ? ' · טרייה מהיום' : (s.breakoutDaysAgo ? ` · לפני ${s.breakoutDaysAgo} ימים` : '');
 
       return [
         '<blockquote>',
-        `<b>${s.symbol}</b> · ${safeName}`,
+        `<b>${s.symbol}</b> · ${safeName}${freshTag}`,
         '',
         `<b>מחיר</b> — $${s.price.toFixed(2)}`,
-        `<b>פריצה</b> — $${s.breakoutLevel.toFixed(2)}`,
-        `<b>סטופ</b> — $${s.stopLoss.toFixed(2)}`,
+        `<b>Upper Buffer</b> — $${s.breakoutLevel.toFixed(2)}`,
+        `<b>סטופ נגרר</b> — $${s.stopLoss.toFixed(2)}`,
         `<b>מרחק לסטופ</b> — ${s.riskPercent}%`,
         '',
         `<a href="${tvUrl}">פתח גרף ↗</a>`,
@@ -437,7 +599,7 @@ app.get('/api/alert', async (req, res) => {
     const message = `${title}\n\n${cards.join('\n\n')}`;
     await sendTelegramMessage(message);
 
-    res.json({ ok: true, sent: breakouts.length });
+    res.json({ ok: true, sent: breakouts.length, scannedCount });
   } catch (err) {
     console.error('Alert error:', err);
     res.status(500).json({ ok: false, error: err.message });
