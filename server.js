@@ -628,7 +628,163 @@ app.get('/api/alert', async (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
+// ==========================================
+// חיבור למסחר דמה אוטומטי ב-Alpaca (Paper Trading)
+// ==========================================
 
+function getAlpacaConfig() {
+  const apiKey = process.env.ALPACA_API_KEY;
+  const secretKey = process.env.ALPACA_SECRET_KEY;
+  const baseUrl = (process.env.ALPACA_BASE_URL || 'https://paper-api.alpaca.markets').replace(/\/+$/, '');
+  const tradeAmountUsd = Number(process.env.TRADE_AMOUNT_USD || 1000);
+  return { apiKey, secretKey, baseUrl, tradeAmountUsd };
+}
+
+async function alpacaRequest(endpoint, options = {}) {
+  const { apiKey, secretKey, baseUrl } = getAlpacaConfig();
+  if (!apiKey || !secretKey) {
+    throw new Error('Missing ALPACA_API_KEY or ALPACA_SECRET_KEY');
+  }
+
+  const res = await fetch(`${baseUrl}${endpoint}`, {
+    ...options,
+    headers: {
+      'APCA-API-KEY-ID': apiKey,
+      'APCA-API-SECRET-KEY': secretKey,
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    }
+  });
+
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+
+  if (!res.ok) {
+    throw new Error(`Alpaca API ${res.status}: ${typeof data === 'string' ? data : JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+// שליחת פקודות דמה למניות שפורצות היום (עם הגנת כפילויות וסטופ-לוס מובנה)
+async function executePaperTrades(breakouts) {
+  const { tradeAmountUsd } = getAlpacaConfig();
+  const freshBreakouts = breakouts.filter(b => b.isFresh);
+  const results = [];
+
+  if (freshBreakouts.length === 0) return results;
+
+  // משיכת פוזיציות ופקודות פתוחות כדי למנוע קנייה כפולה
+  const [positions, openOrders] = await Promise.all([
+    alpacaRequest('/v2/positions'),
+    alpacaRequest('/v2/orders?status=open')
+  ]);
+
+  const activeSymbols = new Set([
+    ...positions.map(p => p.symbol),
+    ...openOrders.map(o => o.symbol)
+  ]);
+
+  for (const stock of freshBreakouts) {
+    if (activeSymbols.has(stock.symbol)) {
+      results.push({ symbol: stock.symbol, status: 'SKIPPED', reason: 'כבר קיימת פוזיציה או פקודה פתוחה' });
+      continue;
+    }
+
+    // Alpaca דורשת כמות מניות שלמה (Integer) לפקודות עם Stop Loss מובנה
+    const qty = Math.floor(tradeAmountUsd / stock.price);
+    if (qty < 1) {
+      results.push({ symbol: stock.symbol, status: 'SKIPPED', reason: `מחיר מניה ($${stock.price}) גבוה מתקציב העסקה ($${tradeAmountUsd})` });
+      continue;
+    }
+
+    try {
+      const order = await alpacaRequest('/v2/orders', {
+        method: 'POST',
+        body: JSON.stringify({
+          symbol: stock.symbol,
+          qty: String(qty),
+          side: 'buy',
+          type: 'market',
+          time_in_force: 'day',
+          order_class: 'oto',
+          stop_loss: {
+            stop_price: Number(stock.stopLoss.toFixed(2))
+          }
+        })
+      });
+
+      activeSymbols.add(stock.symbol);
+      results.push({
+        symbol: stock.symbol,
+        status: 'EXECUTED',
+        qty,
+        price: stock.price,
+        stopLoss: stock.stopLoss,
+        orderId: order.id
+      });
+    } catch (err) {
+      results.push({ symbol: stock.symbol, status: 'ERROR', reason: err.message });
+    }
+  }
+
+  return results;
+}
+
+// נתיב בדיקת חיבור לחשבון הדמה ב-Alpaca
+app.get('/api/alpaca/status', async (req, res) => {
+  try {
+    const [account, positions, openOrders] = await Promise.all([
+      alpacaRequest('/v2/account'),
+      alpacaRequest('/v2/positions'),
+      alpacaRequest('/v2/orders?status=open')
+    ]);
+
+    res.json({
+      ok: true,
+      accountNumber: account.account_number,
+      status: account.status,
+      cash: account.cash,
+      buyingPower: account.buying_power,
+      equity: account.equity,
+      openPositionsCount: positions.length,
+      openOrdersCount: openOrders.length
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// נתיב סריקה + ביצוע מסחר דמה אוטומטי + דיווח לטלגרם
+app.get('/api/trade', async (req, res) => {
+  try {
+    const { breakouts, scannedCount } = await runScan();
+    const tradeResults = await executePaperTrades(breakouts);
+
+    if (tradeResults.length > 0) {
+      const lines = tradeResults.map(r => {
+        if (r.status === 'EXECUTED') {
+          return `✅ <b>${r.symbol}</b> — נקנו ${r.qty} מניות (~$${r.price}) | סטופ: $${r.stopLoss}`;
+        }
+        if (r.status === 'SKIPPED') {
+          return `⏭️ <b>${r.symbol}</b> — דולג (${r.reason})`;
+        }
+        return `❌ <b>${r.symbol}</b> — שגיאה: ${r.reason}`;
+      });
+
+      await sendTelegramMessage(`<b>TAO 2 · דוח מסחר דמה (Alpaca)</b>\n\n${lines.join('\n')}`);
+    }
+
+    res.json({ ok: true, scannedCount, breakoutsFound: breakouts.length, tradeResults });
+  } catch (err) {
+    console.error('Trade error:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 app.listen(PORT, () => {
   console.log(`TAO2 Scanner listening on port ${PORT}`);
 });
